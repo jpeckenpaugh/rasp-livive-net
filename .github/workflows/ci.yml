@@ -1,0 +1,272 @@
+# CI skeleton for rasp-livive-net (F-07).
+#
+# This workflow exists to catch the mistakes this repo is actually likely to
+# make, and nothing else:
+#
+#   unformatted code / clippy regressions  -> lint-test
+#   corpus drift or corruption             -> corpus-integrity (offline)
+#   wasm build breakage                    -> wasm-build
+#   fixture pipeline rot                   -> fixtures-smoke (arms itself, see below)
+#
+# Deliberately NOT in this workflow:
+#   - Deployment. GitHub Pages publishing is S-01 and owns its own workflow and
+#     permissions. This one is read-only and must stay that way.
+#   - wasm-bindgen / wasm-opt / the real wasm size gate. W-01 introduces the
+#     first `wasm-bindgen` dependency and W-02 the budget; see the TODO in the
+#     wasm-build job.
+#   - Upstream corpus comparison. A rebake upstream must never turn every pull
+#     request red; it runs on a schedule instead, in corpus-upstream.yml.
+#
+# Local equivalent before pushing (docs/setup.md section 7):
+#   cargo fmt --all --check
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   cargo test --workspace
+#   cargo build --workspace --target wasm32-unknown-unknown --release
+#   python3 scripts/vendor_corpus.py --check
+#
+# Action pinning: actions use floating major tags for readability. Before the
+# first public release (S-01) tighten every `uses:` below to a full commit SHA,
+# because a tag can be moved and a workflow runs with the repo token.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege. Nothing here writes to the repository; S-01's deploy
+# workflow gets the wider block. Do not widen this one to "fix" a red job.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref: a force-push or a burst of commits
+# does not need several concurrent 7 MB checkouts. PRs are grouped by number,
+# branches by ref, so a PR and a push never cancel each other.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    name: lint + test (native)
+    runs-on: ubuntu-latest
+    steps:
+      # NOTE: tighten to a commit SHA at S-01 (see header).
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml is the single source of truth for the compiler,
+      # rustfmt/clippy components and the wasm32 target. `rustup show` resolves
+      # the override from the file in the working directory; installing the
+      # resolved toolchain explicitly is what makes the pin real on a runner
+      # that only ships `stable`.
+      - name: Install toolchain pinned by rust-toolchain.toml
+        run: |
+          toolchain="$(rustup show active-toolchain | cut -d' ' -f1)"
+          echo "pinned toolchain: $toolchain"
+          rustup toolchain install "$toolchain" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy \
+            --target wasm32-unknown-unknown
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # rust-cache hashes Cargo.lock, Cargo.toml, the toolchain file and the
+          # rustc version into its key already; the explicit hash is there so the
+          # invalidation rule is visible in review and survives a change in that
+          # default. Only the registry/git dirs and target/ are cached - nothing
+          # that could fake a successful build.
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  wasm-build:
+    name: wasm release build
+    runs-on: ubuntu-latest
+    steps:
+      # NOTE: tighten to a commit SHA at S-01 (see header).
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain pinned by rust-toolchain.toml
+        run: |
+          toolchain="$(rustup show active-toolchain | cut -d' ' -f1)"
+          echo "pinned toolchain: $toolchain"
+          rustup toolchain install "$toolchain" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy \
+            --target wasm32-unknown-unknown
+          rustc --version
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Same key policy as lint-test; see the comment there.
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: cargo build --workspace --target wasm32-unknown-unknown --release
+        run: cargo build --workspace --target wasm32-unknown-unknown --release
+
+      # TODO(W-02): when W-01/W-02 land, this job must also
+      #   1. install `wasm-bindgen-cli` 0.2.129 (the exact version pinned in
+      #      docs/setup.md; it must match the crate version or generation
+      #      fails) - cache the install, e.g. with `taiki-e/install-action` or
+      #      an actions/cache step, never an uncached `cargo install` per run;
+      #   2. install `wasm-opt` (binaryen) at a pinned version;
+      #   3. run `wasm-bindgen --target web` and `wasm-opt -Oz` on the output;
+      #   4. enforce the real size gate: total gzipped bundle <= 1.5 MB
+      #      (PLAN section 8 / R9 / X-08) and record the number in docs/perf.md.
+      # Until W-01, no crate depends on wasm-bindgen, so installing the CLI
+      # here would only add minutes and a version-mismatch failure mode.
+      - name: Report wasm artifact sizes (no gate yet - see TODO(W-02))
+        run: |
+          set -euo pipefail
+          found=0
+          for f in target/wasm32-unknown-unknown/release/*.wasm; do
+            [ -e "$f" ] || continue
+            found=1
+            raw=$(wc -c < "$f")
+            gz=$(gzip -9 -c "$f" | wc -c)
+            printf '%-58s %9d B raw   %9d B gzip\n' "$f" "$raw" "$gz"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "no .wasm artifact under target/wasm32-unknown-unknown/release"
+            echo "(expected while the workspace has no wasm-facing crate; see TODO(W-02))"
+          fi
+
+  corpus-integrity:
+    name: corpus integrity (offline)
+    runs-on: ubuntu-latest
+    steps:
+      # NOTE: tighten to a commit SHA at S-01 (see header).
+      - uses: actions/checkout@v4
+
+      # Verifies every registry path, file presence, byte count and SHA-256
+      # against web/registry.json, plus build.totals. No network, no Rust, no
+      # pip installs: standard-library Python only, ~0.1 s for 1,404 files /
+      # 7,005,583 bytes (scripts/README.md, "CI (F-07)").
+      #
+      # The runner still has network access - GitHub cannot drop it per job -
+      # but the command does not use it. `--compare-upstream` is intentionally
+      # not called here: an upstream rebake (new build id, new hashes) is not a
+      # defect in this pull request, and required CI must stay deterministic.
+      # It runs weekly and on demand in .github/workflows/corpus-upstream.yml.
+      - name: python3 scripts/vendor_corpus.py --check
+        run: python3 scripts/vendor_corpus.py --check
+
+  fixtures-smoke:
+    name: fixtures smoke (F-05)
+    runs-on: ubuntu-latest
+    steps:
+      # NOTE: tighten to a commit SHA at S-01 (see header).
+      - uses: actions/checkout@v4
+
+      # F-05 may not have landed yet. Hard-coding this job to run
+      # scripts/make_fixtures.py would make every push red for a missing file,
+      # and marking it `continue-on-error: true` would silently keep it red
+      # forever. Instead the job probes for the script once: it is a real gate
+      # (continue-on-error: false, which is the default) from the moment the
+      # script exists, and a loud warning-only no-op until then. The warning
+      # becomes actionable the day F-05 lands, and nobody has to remember to
+      # switch it on. Remove the guard step once F-05 is merged.
+      - name: Probe for scripts/make_fixtures.py (F-05)
+        id: fixtures
+        run: |
+          if [ -f scripts/make_fixtures.py ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "scripts/make_fixtures.py found - fixture smoke test is armed"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=fixtures-smoke is a no-op::scripts/make_fixtures.py does not exist yet (F-05 not landed). This job arms itself automatically when the script appears."
+          fi
+
+      - name: ffmpeg version
+        if: steps.fixtures.outputs.present == 'true'
+        run: ffmpeg -version | head -1
+
+      # Proves the fixture path works from a clean checkout using only the
+      # vendored corpus in web/audio/ (no committed audio in fixtures/).
+      - name: Generate fixtures from the vendored corpus
+        if: steps.fixtures.outputs.present == 'true'
+        run: python3 scripts/make_fixtures.py
+
+      # The manifest is the contract other tests consume; 12 clips is F-05's
+      # acceptance criterion. Tolerates a JSON list or the usual wrapper keys
+      # so the check does not fail on a cosmetic choice, and fails loudly with
+      # a readable message if the shape is something else.
+      - name: Verify fixture manifest lists 12 clips
+        if: steps.fixtures.outputs.present == 'true'
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import sys
+
+          paths = sorted(glob.glob("fixtures/**/manifest*.json", recursive=True))
+          if not paths:
+              sys.exit("fixtures-smoke: no fixtures/**/manifest*.json - make_fixtures.py output moved?")
+
+          path = paths[0]
+          with open(path, encoding="utf-8") as fh:
+              data = json.load(fh)
+
+          if isinstance(data, dict):
+              for key in ("clips", "fixtures", "entries", "items"):
+                  if key in data:
+                      data = data[key]
+                      break
+              else:
+                  sys.exit(f"fixtures-smoke: {path} has no clips/fixtures/entries/items list - update this check")
+
+          count = len(data)
+          print(f"fixtures-smoke: {path} lists {count} clips")
+          if count != 12:
+              sys.exit(f"fixtures-smoke: expected 12 clips, found {count}")
+          PY
+
+      # P-07b: the pitch ruler must report <= 1 cent on an exact resampler
+      # control at every in-band semitone. The fixtures generated above are
+      # the input; the pinned venv is installed here rather than cached so a
+      # requirements change cannot be masked by a stale environment. Python is
+      # pinned because the requirements (numpy 1.26.4 / scipy 1.13.1) do not
+      # have wheels for every interpreter a future ubuntu-latest may ship.
+      - uses: actions/setup-python@v5
+        if: steps.fixtures.outputs.present == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned metrics venv
+        if: steps.fixtures.outputs.present == 'true'
+        run: |
+          python3 -m venv scripts/.venv
+          scripts/.venv/bin/pip install --disable-pip-version-check \
+            -r scripts/requirements.txt
+
+      - name: metrics.py --self-test (pitch ruler)
+        if: steps.fixtures.outputs.present == 'true'
+        run: scripts/.venv/bin/python scripts/metrics.py --self-test --check
+
+      # P-07c: the formant ruler's known-exact control.  Synthetic vowels with
+      # formants known by construction at F0 90-300 Hz; the harmonic-model
+      # estimator must recover every formant within 1%, and a deliberately
+      # corrupted expectation must be rejected.  It does not read fixtures, but
+      # it shares the pinned venv installed above, so it runs under the same
+      # condition.  ~7 s.
+      - name: metrics.py --formant-self-test (formant ruler)
+        if: steps.fixtures.outputs.present == 'true'
+        run: scripts/.venv/bin/python scripts/metrics.py --formant-self-test

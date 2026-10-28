@@ -1,0 +1,14 @@
+# Pinned Rust toolchain for RASP.
+#
+# rustup reads this file in every directory below the repo root, so a clean
+# checkout gets the same compiler, formatter, and linter without an explicit
+# `rustup override`. See docs/setup.md for the manual install commands.
+#
+# Bump this deliberately, in its own commit, and re-run the PLAN section 8
+# gate commands afterwards. Do not use `channel = "stable"`: the toolchain
+# version is part of the reproducibility contract for every later task.
+
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

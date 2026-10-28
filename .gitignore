@@ -1,0 +1,32 @@
+# Rust build output
+/target
+/spikes/**/target
+
+# Generated fixtures (the directory itself stays tracked)
+# `python3 scripts/make_fixtures.py` writes fixtures/{wav,f32,reference}/* and
+# fixtures/manifest.json. They are derived audio: regenerated locally and in CI,
+# never committed (PLAN §8: no committed fixtures over 1 MB). Only the README,
+# which explains how to build them, and the .gitkeep placeholder are tracked.
+fixtures/*
+!fixtures/.gitkeep
+!fixtures/README.md
+fixtures/wav/
+fixtures/f32/
+fixtures/reference/
+fixtures/manifest.json
+
+# Rendered WAV outputs live under fixtures/, never committed
+fixtures/**/*.wav
+
+# JavaScript / Python tooling
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Generated wasm (D18): built by `scripts/build_wasm.sh` and by CI, never committed.
+# The smoke page and the app require a build step before serving.
+web/wasm/
+
+# macOS
+.DS_Store

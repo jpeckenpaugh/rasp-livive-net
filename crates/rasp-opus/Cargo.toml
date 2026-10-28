@@ -1,0 +1,13 @@
+[package]
+name = "rasp-opus"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# WebM/Matroska demux only. `default-features = false` keeps FLAC/Vorbis/WAV/
+# ADPCM decoders out of the wasm bundle (PLAN D-02, docs/spikes/decode.md).
+symphonia = { version = "0.6.1", default-features = false, features = ["mkv"] }
+# Raw Opus packet decode. Default features are already off; the encoder, Ogg
+# reader, and DRED/PLC paths are not used. BSD-3-Clause.
+opus-pure = "0.2.2"

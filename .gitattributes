@@ -1,0 +1,9 @@
+# Binary assets: never apply EOL conversion or diff them as text.
+#
+# The vendored corpus is 1,404 `.weba` files / 7,005,583 bytes whose SHA-256
+# values are enforced by `scripts/vendor_corpus.py --check`. A CRLF rewrite on
+# checkout would break every hash and inflate the payload, so mark it binary
+# explicitly rather than relying on git's heuristic.
+*.weba binary
+*.wasm binary
+*.f32 binary

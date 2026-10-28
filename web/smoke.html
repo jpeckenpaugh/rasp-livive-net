@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RASP — D-04 decode smoke</title>
+    <!-- Empty data URI: avoids a /favicon.ico 404 console error on a clean load. -->
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #101216;
+        --panel: #181b21;
+        --panel-2: #1f232b;
+        --line: #2c323c;
+        --ink: #e7eaf0;
+        --muted: #9aa4b2;
+        --ok: #6ee7a8;
+        --bad: #ff8b8b;
+        --accent: #8ab4ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0 auto;
+        max-width: 64rem;
+        padding: 2rem 1rem 4rem;
+        background: var(--bg);
+        color: var(--ink);
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+      h2 { font-size: 1.1rem; margin: 0 0 0.75rem; }
+      p { margin: 0.4rem 0; }
+      code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      code { font-size: 0.9em; color: var(--accent); }
+      .sub { color: var(--muted); max-width: 52rem; }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 1rem 1.1rem;
+        margin: 1rem 0;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: max-content 1fr;
+        gap: 0.25rem 1.25rem;
+        margin: 0;
+      }
+      .grid dt { color: var(--muted); }
+      .grid dd { margin: 0; }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        align-items: end;
+      }
+      label { display: grid; gap: 0.3rem; color: var(--muted); font-size: 0.85rem; }
+      select {
+        min-width: 18rem;
+        max-width: 100%;
+        padding: 0.45rem 0.5rem;
+        background: var(--panel-2);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        font: inherit;
+      }
+      button {
+        padding: 0.5rem 0.9rem;
+        background: var(--panel-2);
+        color: var(--ink);
+        border: 1px solid #3a4250;
+        border-radius: 6px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) { border-color: var(--accent); }
+      button:disabled { opacity: 0.5; cursor: default; }
+      button.primary { background: #274a7a; border-color: #3a6aa8; }
+      #status { min-height: 1.5em; color: var(--muted); }
+      #status.error { color: var(--bad); }
+      #status.ok { color: var(--ok); }
+      progress { width: 100%; height: 0.9rem; accent-color: var(--accent); }
+      .result-ok { color: var(--ok); }
+      .result-bad { color: var(--bad); }
+      #errors { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--bad); font-size: 0.85rem; }
+      .hint { color: var(--muted); font-size: 0.85rem; }
+      details { margin-top: 0.75rem; }
+      summary { cursor: pointer; color: var(--bad); }
+      footer { margin-top: 2rem; color: var(--muted); font-size: 0.85rem; }
+      .fatal { border-color: var(--bad); }
+      .fatal h2 { color: var(--bad); }
+    </style>
+  </head>
+  <body>
+    <h1>RASP — D-04 decode smoke</h1>
+    <p class="sub">
+      Vendored <code>.weba</code> → Rust (<code>rasp-opus</code>) in WebAssembly →
+      <code>AudioBufferSourceNode</code>. <strong>No DSP, no worklet, no resampler</strong>:
+      this page proves the path is sound before any processing exists. A failure here is a
+      decode/wasm/browser failure, not a DSP failure.
+    </p>
+
+    <section class="panel" id="fatal" hidden>
+      <h2>Module failed to load</h2>
+      <p id="fatal-message" class="mono"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Module</h2>
+      <dl class="grid">
+        <dt>version()</dt><dd id="st-version">loading…</dd>
+        <dt>wasm size</dt><dd id="st-wasm">loading…</dd>
+        <dt>init</dt><dd id="st-init">—</dd>
+        <dt>AudioContext</dt><dd id="st-rate">not created yet (needs a click)</dd>
+        <dt>registry</dt><dd id="st-registry">loading…</dd>
+      </dl>
+    </section>
+
+    <section class="panel">
+      <h2>One clip</h2>
+      <div class="controls">
+        <label>Voice <select id="voice"></select></label>
+        <label>Phrase <select id="phrase"></select></label>
+        <button id="decode" type="button">Decode selected</button>
+        <button id="play" class="primary" type="button">Play decoded</button>
+      </div>
+      <p class="hint">
+        Changing either select decodes immediately. “Play decoded” plays the decoded buffer;
+        if the selection changed and decoding has not finished, it decodes first.
+      </p>
+      <p id="status" role="status" aria-live="polite">Waiting for the registry…</p>
+      <dl class="grid" id="last-clip">
+        <dt>clip</dt><dd id="st-clip">—</dd>
+        <dt>samples</dt><dd id="st-frames">—</dd>
+        <dt>duration</dt><dd id="st-duration">—</dd>
+        <dt>format</dt><dd id="st-format">—</dd>
+        <dt>decode</dt><dd id="st-decode">—</dd>
+        <dt>peak</dt><dd id="st-peak">—</dd>
+      </dl>
+    </section>
+
+    <section class="panel">
+      <h2>All 1404 clips</h2>
+      <div class="controls">
+        <button id="decode-all" class="primary" type="button">Decode all 1404 clips</button>
+      </div>
+      <p class="hint">
+        Sequential fetch → wasm decode. You can leave <em>Play decoded</em> and the audio
+        context alone; this run creates the context (from this click) only to report the
+        browser's observed sample rate. Every failed clip is listed by id with its error.
+      </p>
+      <progress id="all-progress" max="1404" value="0" hidden></progress>
+      <p id="all-status" role="status" aria-live="polite">Not run yet.</p>
+      <dl class="grid" id="all-report">
+        <dt>clips</dt><dd id="st-all-clips">—</dd>
+        <dt>audio</dt><dd id="st-all-audio">—</dd>
+        <dt>decode ms</dt><dd id="st-all-decode">—</dd>
+        <dt>throughput</dt><dd id="st-all-throughput">—</dd>
+        <dt>AudioContext</dt><dd id="st-all-rate">—</dd>
+        <dt>wall</dt><dd id="st-all-wall">—</dd>
+      </dl>
+      <details id="all-errors-wrap" hidden>
+        <summary id="all-errors-summary">Failures</summary>
+        <pre id="errors"></pre>
+      </details>
+    </section>
+
+    <footer>
+      D-04 · <code>node scripts/verify_wasm_decode.mjs</code> is the headless counterpart.
+      Build: <code>bash scripts/build_wasm.sh</code> · Serve: <code>bash scripts/serve.sh</code>.
+    </footer>
+
+    <script type="module" src="./smoke.js"></script>
+  </body>
+</html>

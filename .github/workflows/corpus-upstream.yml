@@ -1,0 +1,46 @@
+# Scheduled upstream corpus drift sentinel (F-07).
+#
+# `vendor_corpus.py --compare-upstream` is the only mode that can see the
+# origin: it fetches the upstream registry and reports build id, per-clip
+# sha256/bytes/durationMs changes, additions and removals. It writes nothing.
+#
+# Why this is a separate workflow instead of a job in ci.yml: the corpus is a
+# pinned snapshot (DECISIONS D6). An upstream rebake is news, not a defect in
+# the pull request under review, so calling it on every PR would turn unrelated
+# work red for a third party's rebuild. Scheduled + manual only.
+#
+# Exit codes: 0 = snapshot still matches upstream; 1 = upstream was rebuilt.
+# Red here therefore means "decide whether to re-vendor", NOT "the committed
+# corpus is corrupt" -- that is `--check`'s job in ci.yml, which is offline.
+# Resolution is human and always the same:
+#   python3 scripts/vendor_corpus.py --refresh-registry
+# then review the web/registry.json diff and commit it. Never hand-edit it.
+
+name: Corpus upstream drift
+
+on:
+  schedule:
+    # Mondays, 06:17 UTC. Deliberately off the hour: GitHub queues scheduled
+    # workflows at :00 and delays there are common.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+# Read-only. The compare mode fetches upstream but never writes, and nothing
+# here commits a refreshed corpus automatically.
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-upstream
+  cancel-in-progress: true
+
+jobs:
+  compare-upstream:
+    name: compare vendored corpus with upstream
+    runs-on: ubuntu-latest
+    steps:
+      # NOTE: tighten to a commit SHA at S-01, like the pins in ci.yml.
+      - uses: actions/checkout@v4
+
+      - name: python3 scripts/vendor_corpus.py --compare-upstream
+        run: python3 scripts/vendor_corpus.py --compare-upstream
