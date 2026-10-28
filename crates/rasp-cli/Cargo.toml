@@ -9,3 +9,9 @@ name = "rasp"
 path = "src/main.rs"
 
 [dependencies]
+# The product DSP chain (P-08's loudness stage is already the last step of
+# `NaturalRenderer`) and the product decoder (D-01/D-02). Both are in-workspace
+# crates: the CLI adds no external dependencies, so the wasm-adjacent tree stays
+# small and the CLI's output is the same code the worklet will run.
+rasp-dsp = { path = "../rasp-dsp" }
+rasp-opus = { path = "../rasp-opus" }

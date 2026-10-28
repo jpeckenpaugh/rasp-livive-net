@@ -61,6 +61,11 @@ Measured on synthetic vowels with known formants: a 40 ms lifter keeps harmonic 
 
 *Rejected:* LPC as default (numbers above), 40 ms liftering (wrong ruler for a 100–300 Hz F0 corpus).
 
+**P-05 amendment, 2026-10-28 — the lifter must follow the pitch.**
+A fixed 4 ms lifter exceeds the pitch period once the *output* F0 rises above ~250 Hz, so the "envelope" starts tracking individual harmonics and the correction chases them: measured HNR **−4.7…−8.9 dB** and p90 spread up to 1207 cents on upward presets. The lifter is now capped at `min(configured, 0.75 / F0)`.
+
+This is inactive at every P-03 measured cell (output F0 ≤ 165 Hz), so P-03's formant table is byte-identical. It removed 13 of 14 preset D17 failures and all 30 octave outliers. The constant `0.75/F0` is a guard against lifter-over-period, not a tuning knob.
+
 ---
 
 ## D4 — AudioWorklet is the product path; AudioBufferSourceNode is the A/B path

@@ -136,6 +136,10 @@ dependencies = [
 [[package]]
 name = "rasp-cli"
 version = "0.1.0"
+dependencies = [
+ "rasp-dsp",
+ "rasp-opus",
+]
 
 [[package]]
 name = "rasp-dsp"
