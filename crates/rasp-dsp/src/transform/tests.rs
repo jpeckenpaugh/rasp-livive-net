@@ -930,3 +930,230 @@ fn cpu_cost() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// P-03c diagnostic: the correction pass's pitch spread
+// ---------------------------------------------------------------------------
+//
+// Two D17 cells fail on p90: `am_onyx__got-time` at the effective `shift-up`
+// point and `am_eric__good-game` at the effective `deep` point. This dump is
+// the evidence for the P-03c report. It writes, for each cell and control:
+//
+// * `{cell}.ref.f32`       — the fixture (48 kHz mono f32)
+// * `{cell}.shifted.f32`   — the pitch shifter's output, before correction
+// * `{cell}.transform.f32` — the transformer's output (tilt included)
+// * `{cell}.preset.f32`    — the full natural chain (RMS match + limiter)
+// * `{cell}.gain_db.f32`   — the exact applied correction gain, frame-major,
+//                            as `frames, bins, total` u32 header then f32 dB
+// * `{cell}.target.f32`, `{cell}.observed.f32` — both envelopes, nepers
+// * `{cell}.synth_ref.f32`, `{cell}.synth_shifted.f32` — a stationary synthetic
+//   vowel at 110 Hz and the same vowel through the real pitch shifter. Applying
+//   the dumped gain curve to `synth_shifted` isolates the pass from real
+//   speech: it is pitch-transparent (< 0.3 c p90).
+// * `README.txt` — the reading instructions and the two failing points.
+//
+// The verdicts come from the official ruler, so the companion step is
+// `scripts/metrics.py --renders` over `{cell}.preset.f32`; the gain/envelope
+// matrices are for the correlation and instantaneous-frequency analysis in the
+// P-03c report.
+//
+// ```text
+// cargo test -p rasp-dsp --release p03c_spread_dump -- --ignored --nocapture
+// ```
+
+fn diag_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("rasp-p03c-diag");
+    std::fs::create_dir_all(&dir).expect("create diag dir");
+    dir
+}
+
+fn diag_write(name: &str, samples: &[f32]) {
+    let bytes: Vec<u8> = samples.iter().flat_map(|x| x.to_le_bytes()).collect();
+    std::fs::write(diag_dir().join(name), bytes).expect("write diag dump");
+}
+
+fn diag_write_matrix(name: &str, frames: usize, bins: usize, values: &[f32]) {
+    assert_eq!(values.len(), frames * bins);
+    let mut bytes = Vec::with_capacity(values.len() * 4 + 12);
+    bytes.extend_from_slice(&(frames as u32).to_le_bytes());
+    bytes.extend_from_slice(&(bins as u32).to_le_bytes());
+    bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    for x in values {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    std::fs::write(diag_dir().join(name), bytes).expect("write diag matrix");
+}
+
+fn tilt_neper_curve(bins: usize, window_size: usize, sample_rate: u32, tilt: f32) -> Vec<f32> {
+    let bin_hz = sample_rate as f32 / window_size as f32;
+    (0..bins)
+        .map(|bin| {
+            let hz = (bin as f32 * bin_hz).max(1.0);
+            let db = (tilt * (hz / 1000.0).log2()).clamp(-40.0, 40.0);
+            db / 8.685_889
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "diagnostic dump: cargo test -p rasp-dsp --release p03c_spread_dump -- --ignored --nocapture"]
+fn p03c_spread_dump() {
+    let Some(fixtures) = testutil::load_fixtures() else {
+        println!("fixtures absent; nothing to dump");
+        return;
+    };
+    // (cell, fixture, pitch_st, formant, tilt, input F0 for the control)
+    let cells: [(&str, &str, f32, f32, f32, f64); 5] = [
+        ("a_full", "am_onyx__got-time", 7.0, 1.10, 0.75, 88.4),
+        ("a_f10", "am_onyx__got-time", 7.0, 1.0, 0.0, 88.4),
+        ("b_full", "am_eric__good-game", -3.6, 0.863_96, 0.0, 161.6),
+        ("b_f867", "am_eric__good-game", -3.6, 0.867, 0.0, 161.6),
+        ("b_f10", "am_eric__good-game", -3.6, 1.0, 0.0, 161.6),
+    ];
+    let mut readme = String::from(
+        "P-03c diagnostic dump\n\n\
+         Cells (see the report):\n\
+         * a_full: am_onyx__got-time, effective shift-up (+7 st, formant 1.10, tilt +0.75).\n\
+         * b_full: am_eric__good-game, effective deep (-3.60 st, formant 0.86396).\n\
+         Controls: a_f10/b_f10 warp nothing (formant 1.0); b_f867 is the 0.3% formant\n\
+         neighbour that passes D17.\n\n\
+         Files per cell:\n\
+         * .ref/.shifted/.transform/.preset.f32: 48 kHz mono f32 samples.\n\
+         * .gain_db.f32: u32 frames, u32 bins, u32 total, then f32 dB frame-major.\n\
+         * .target.f32/.observed.f32: the same header, values in nepers.\n\
+         * .synth_ref/.synth_shifted.f32: stationary 110 Hz vowel before/after the\n\
+           real shifter; the gain curve is pitch-transparent on it.\n\n\
+         Reading: apply .gain_db.f32 to the STFT of .shifted.f32 (window = the\n\
+         correction window in .meta.txt, hop = window/4), then ISTFT. The result\n\
+         reproduces .transform.f32 to about 1e-5. Per-frame gain modulation,\n\
+         envelope jitter, the stationary/noise controls and the per-harmonic\n\
+         instantaneous-frequency comparison are what the report quotes.\n",
+    );
+    for (cell, fixture_name, pitch_st, formant, tilt, control_f0) in cells {
+        let fixture = fixtures
+            .iter()
+            .find(|f| f.name == fixture_name)
+            .expect("fixture present");
+        let input = &fixture.samples;
+        let ratio = 2.0f32.powf(pitch_st / 12.0);
+
+        let mut shifter = PitchShifter::new(SR, PitchShiftConfig::auto()).expect("valid");
+        shifter.set_ratio(ratio);
+        let shifted = shifter.process(input).expect("valid pitch render");
+
+        let mut tr = transformer(VoiceTransformConfig::d2());
+        tr.set_pitch_semitones(pitch_st);
+        tr.set_formant_ratio(formant);
+        tr.set_tilt_db_per_oct(tilt);
+        let corrected = tr.process(input).expect("valid transform");
+
+        let mut renderer = crate::params::NaturalRenderer::d2(SR).expect("valid natural chain");
+        renderer.set_headroom(crate::headroom::HeadroomMode::Off);
+        renderer.set_params(crate::params::NaturalParams::new(pitch_st, formant, tilt));
+        let preset = renderer.process(input).expect("valid preset render");
+
+        // Reproduce the correction analysis exactly (public API only), so the
+        // dumped gain is the gain the render actually applied.
+        let n = tr.correction_window_size();
+        let hop = n / 4;
+        let bins = n / 2 + 1;
+        let mut stft = Stft::new(StftConfig::new(n, hop)).expect("valid stft");
+        let input_spec = stft.analyze(input);
+        let shifted_spec = stft.analyze(&shifted);
+        let mut analyzer = EnvelopeAnalyzer::new(SR, EnvelopeConfig::cepstral()).expect("valid");
+        analyzer.set_lifter_seconds(tr.effective_lifter_seconds());
+        let input_env = analyzer.analyze(&input_spec).expect("valid envelope");
+        let observed = analyzer.analyze(&shifted_spec).expect("valid envelope");
+        let mut target = input_env.warp(formant);
+        let tilt_curve = tilt_neper_curve(bins, n, SR, tilt);
+        for frame in 0..target.frames() {
+            if let Some(values) = target.frame_mut(frame) {
+                for (value, &gain) in values.iter_mut().zip(&tilt_curve) {
+                    *value += gain;
+                }
+            }
+        }
+        let limit = EnvelopeConfig::cepstral().max_gain_neper();
+        let mut gains_db = vec![0.0f32; input_spec.frames() * bins];
+        for frame in 0..input_spec
+            .frames()
+            .min(target.frames())
+            .min(observed.frames())
+        {
+            let (Some(tf), Some(of)) = (target.frame(frame), observed.frame(frame)) else {
+                break;
+            };
+            for bin in 0..bins {
+                let correction = (tf[bin] - of[bin]).clamp(-limit, limit);
+                gains_db[frame * bins + bin] = correction * 8.685_889;
+            }
+        }
+
+        // The stationary control: a synthetic vowel at a known F0, and the same
+        // vowel through the real shifter (so the control has the shifter's own
+        // phase-vocoder texture).
+        let vowel = testutil::vowel(
+            control_f0,
+            &[700.0, 1220.0, 2600.0],
+            &[80.0, 90.0, 120.0],
+            SR,
+            input.len(),
+        );
+        let mut control_shifter = PitchShifter::new(SR, PitchShiftConfig::auto()).expect("valid");
+        control_shifter.set_ratio(ratio);
+        let shifted_vowel = control_shifter.process(&vowel).expect("valid");
+        diag_write(&format!("{cell}.synth_ref.f32"), &vowel);
+        diag_write(&format!("{cell}.synth_shifted.f32"), &shifted_vowel);
+
+        diag_write(&format!("{cell}.ref.f32"), input);
+        diag_write(&format!("{cell}.shifted.f32"), &shifted);
+        diag_write(&format!("{cell}.transform.f32"), &corrected);
+        diag_write(&format!("{cell}.preset.f32"), &preset);
+        let mut target_flat = Vec::with_capacity(target.frames() * bins);
+        let mut observed_flat = Vec::with_capacity(observed.frames() * bins);
+        for frame in 0..target.frames() {
+            target_flat.extend_from_slice(target.frame(frame).expect("frame in range"));
+            observed_flat.extend_from_slice(observed.frame(frame).expect("frame in range"));
+        }
+        diag_write_matrix(
+            &format!("{cell}.target.f32"),
+            target.frames(),
+            bins,
+            &target_flat,
+        );
+        diag_write_matrix(
+            &format!("{cell}.observed.f32"),
+            observed.frames(),
+            bins,
+            &observed_flat,
+        );
+        diag_write_matrix(
+            &format!("{cell}.gain_db.f32"),
+            input_spec.frames(),
+            bins,
+            &gains_db,
+        );
+        let meta = format!(
+            "cell\t{cell}\nfixture\t{fixture_name}\npitch_st\t{pitch_st}\nratio\t{ratio:.9}\n\
+             formant\t{formant}\ntilt\t{tilt}\npitch_window\t{}\ncorrection_window\t{n}\n\
+             hop\t{hop}\nlifter_s\t{}\nframes\t{}\nbins\t{bins}\nsamples\t{}\nclamp_db\t30\n",
+            tr.pitch_window_size(),
+            tr.effective_lifter_seconds(),
+            input_spec.frames(),
+            input.len()
+        );
+        std::fs::write(diag_dir().join(format!("{cell}.meta.txt")), meta).expect("meta");
+        readme.push_str(&format!(
+            "{cell}: {fixture_name} pitch {pitch_st:+.2} formant {formant:.5} tilt {tilt:+.2} N={n} lifter {:.4}s frames {}\n",
+            tr.effective_lifter_seconds(),
+            input_spec.frames()
+        ));
+        println!(
+            "{cell}: {fixture_name} pitch {pitch_st:+.2} formant {formant:.5} tilt {tilt:+.2} N={n} lifter {:.4}s frames {}",
+            tr.effective_lifter_seconds(),
+            input_spec.frames()
+        );
+    }
+    std::fs::write(diag_dir().join("README.txt"), readme).expect("readme");
+    println!("dumped to {}", diag_dir().display());
+}

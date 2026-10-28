@@ -90,9 +90,8 @@
 ## 4. Stage map
 
 ```
-M0 F ──► M1 D ──► M2 P ──► M3 B ──► M4 W ──► M5 U ──► M6 Q ──► M7 X ──► M8 S
-Foundation  Decode   DSP      Robotize  WASM+     Demo     Calib     Perf     Ship
-                     core               Worklet   app
+M0 F ─► M1 D ─► M2 P ─► M3 B ─► M3v V ─► M4 W ─► M5 U ─► M6 Q ─► M7 X ─► M8 S
+Foundation Decode  DSP     Robot   Variants  WASM     Demo    Calib   Perf    Ship
 ```
 
 | Stage | Milestone | Exit criteria |
@@ -175,18 +174,30 @@ Owner column = the agent to dispatch. `PM`/`HUMAN` items are not delegated to su
 | B-07 | VERIFY stage B | VERIFY | B-01..B-06 | Re-runs the full batch; confirms style separation in metrics (styles not converging to the same sound) |
 | **HR-3** | Human round: **blind robot identification** — which style is which, and is it a robot or a person? Plus a first listen for "cheesy" | HUMAN | B-07 | ≥ 90% style ID, "robot" rated ≥ 4/5 plausibility, notes in `docs/qa/round-3.md` |
 
-### Stage W — WASM + AudioWorklet (M4)
+### Stage V — Seeded variant generation (M3v)
+
+The product: `(base_voice, npc_seed) → stable params → audio`, DiceBear-style. An NPC is cast once, and the same seed re-voices nothing when presets change (D24). This stage comes **before** the wasm/app work because it defines what the app will call.
 
 | ID | Task | Owner | Depends | Acceptance |
 |---|---|---|---|---|
-| W-01 | `wasm-bindgen` surface in **`crates/rasp-wasm`** (created by D-04): `init`, `decode(bytes) -> ClipHandle`, `render(clip, natural, robot) -> Float32Array`, explicit `free`; no panics across the boundary; `#![forbid(unsafe_code)]`; document that **callers must `free()`** (D-05 measured 494 MB growth over 1000 unfreed decodes — the generated `FinalizationRegistry` does not save you) | BUILD | D-02, P-06, B-05 | Errors returned as typed results, never traps; 10k init/free cycles with stable RSS |
-| W-02 | Size/ABI budget: CI builds the artifact from source (D18 — nothing generated is committed), `wasm-opt -Oz`, audit exports, strip debug; record baseline; enforce ≤ 1.5 MB gzipped | BUILD | W-01 | Size gate in CI, not a manual script; baseline documented in `docs/perf.md` |
-| W-03 | `AudioWorkletProcessor`: receives clip PCM + params once, renders hop blocks with pre-roll, plays out, reports `underruns`/`processMs` via `port` | BUILD | W-01, D-03 | Zero underruns over 100 plays; start latency < 40 ms |
-| W-04 | Worklet loading: wasm instantiation inside worklet scope, no main-thread dependency after init | BUILD | W-03 | Works Chrome/Safari/Firefox; graceful error if `addModule` fails |
-| W-05 | A/B path: `AudioBufferSourceNode` bypass sharing the same decoded clip, sample-aligned switching | BUILD | W-03 | Switching mid-line phase-continuous within 1 sample; no click |
-| W-06 | Worker offload: decode + offline render in a Web Worker; transfer `Float32Array` ownership (no clone copies) | BUILD | W-01 | Main thread blocked < 16 ms during a 2 s render |
-| W-07 | Params marshalling for both modes: one frozen struct, validated once, versioned so old cached JS cannot send new fields | BUILD | W-01, B-05 | Unknown/missing fields rejected with a typed error, never UB |
-| W-08 | VERIFY stage W | VERIFY | W-01..W-07 | Chrome + Safari + Firefox run-through; leak check; underrun log attached |
+| V-01 | **Seed → parameter generator.** `derive(schema, seed, base_voice) -> VariantSpec` with integer hash streams (SplitMix64), quantised draws (pitch 0.05 st, formant 0.005, tilt 0.25 dB/oct), 12 natural archetypes (masc deep/mid/bright/young, fem low/mid/bright/airy, neutral mid/bright, child, elder). Clamp to D1's validated region; leave headroom to the renderer (D22). Commit golden seed→param vectors | BUILD | P-05, P-05b | 20 golden vectors stable across runs and platforms; every archetype's params inside D1; archetypes recognisably different **on average** (D25 — no pairwise-uniqueness requirement, overlap is expected); 1,000 random seeds all valid |
+| V-02 | Target-voice resolution: `(seed) → base_voice` over the 54. Light weighting so rarely-used voices still appear — no uniform-coverage requirement (D25) | BUILD | V-01 | Report over 10k seeds; same seed always returns the same voice + params; no pathological collapse onto a handful of voices |
+| V-03 | Robot axes in the variant space (style, wet, monotone, jitter) — depends on Stage B | BUILD | V-01, B-05 | Robot archetypes render; monotone gates per language (D11); same seed stable |
+| V-04 | **NPC voice-card demo**: grid of 16 generated NPCs (DiceBear-like), each showing seed, base voice, archetype and params; click to play one line; regenerate button | BUILD | V-01, W-01 | 16 cards in < 2 s; clicking plays through wasm; seeds are shareable via URL |
+| V-05 | Variant QA sweep: 200 seeds × 2 voices through the existing rulers (envelope, level, true peak, D17) | BUILD | V-01, V-04 | 0 envelope violations, 0 octave outliers, level < 1 dB; **no uniqueness or distance gate** (D25); report in `docs/variants.md` |
+
+### Stage W — WASM + playback (M4) · realtime deferred (D23)
+
+| ID | Task | Owner | Depends | Acceptance |
+|---|---|---|---|---|
+| W-01 | `wasm-bindgen` surface in **`crates/rasp-wasm`**: `decode(bytes)`, `render(pcm, VariantSpec) -> Float32Array`, `free`; `#![forbid(unsafe_code)]`; typed errors, no traps; document the `free()` requirement | BUILD | D-02, P-06, V-01 | Errors typed; 10k init/free cycles stable RSS; variant render ≤ 2× native ms/s |
+| W-02 | Size/ABI budget: CI builds from source (D18), `wasm-opt -Oz`, export audit; enforce ≤ 1.5 MB gzipped | BUILD | W-01 | Gate in CI |
+| ~~W-03~~ | ~~AudioWorkletProcessor with pre-roll~~ | — | — | **Deferred (D23)** — not needed for cast-once playback |
+| ~~W-04~~ | ~~worklet module loading~~ | — | — | **Deferred (D23)** |
+| W-05 | Playback path: `AudioBufferSourceNode` from the rendered buffer, sample-aligned A/B against the source | BUILD | W-01 | Switching mid-line phase-continuous within 1 sample; no click |
+| W-06 | Worker offload + cache: decode/render in a Web Worker, store rendered lines in IndexedDB keyed by `(schema, seed, line)` | BUILD | W-01 | Main thread blocked < 16 ms; second play of the same line is from cache |
+| W-07 | Params marshalling: one versioned struct, validated once; unknown fields rejected | BUILD | W-01, V-01 | Old cached JS cannot send a new schema |
+| W-08 | VERIFY stage W | VERIFY | W-01..W-07 | Chrome + Safari + Firefox; leak check; cache-hit check |
 
 ### Stage U — Demo app (M5)
 

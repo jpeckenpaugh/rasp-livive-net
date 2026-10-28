@@ -371,6 +371,61 @@ w            = clamp(room_direction(f) / room_direction(178 Hz), 0, 1)
 
 *Reopen if:* HR-2 shows the middle of the range is also too strong — then reduce the nominal strengths, not the mapping.
 
+---
+
+## D23 — NPC voices are generated once, not processed live
+
+**Date:** 2026-10-28 · **Status:** accepted (revises D4)
+
+The product is a **seeded voice-variant generator**: `(base_voice, npc_seed) → stable parameter set → audio`, the same shape as DiceBear's `(style, seed) → avatar`. An NPC is cast once; the same seed must produce the same voice across all of that NPC's lines and across sessions.
+
+**Consequences:**
+
+- **AudioWorklet is not required.** Render once per NPC line, then play through `AudioBufferSourceNode` from a cached buffer. D4's worklet path is deferred to a possible realtime mode; it is not on the critical path. The whole streaming/pre-roll/latency problem disappears.
+- **Pre-baking is not possible.** NPCs are unbounded: 54 voices × 26 lines × 16 archetypes is already 22,464 clips (~112 MB), and that count grows with the cast. The 7 MB corpus plus ~215 KB wasm generating variants on demand is the only design that scales.
+- Rendering is paid once per line on first use (~100–200 ms in wasm), then cached in IndexedDB / the Cache API.
+
+*Rejected:* precomputing every variant (storage grows with the NPC count and defeats procedural casting), live per-frame processing (nothing in the use case needs it).
+
+---
+
+## D24 — Determinism contract for generated voices
+
+**Date:** 2026-10-28 · **Status:** accepted
+
+A variant is reproducible from `(schema_version, npc_seed, base_voice_id)` alone. The derivation must be platform-independent: integer hash streams (SplitMix64), **no floats in the draw**, then quantisation to fixed perceptual steps (pitch 0.05 st, formant 0.005, tilt 0.25 dB/oct). Golden seed → parameter vectors are committed as tests.
+
+Resolved parameters are stored alongside the NPC record, so a schema bump cannot silently re-voice an existing cast.
+
+*Rejected:* floating-point RNG draws and platform `HashMap` hashing (not reproducible across JS/Rust/browsers); deriving params at play time from the current preset table (a preset change would re-voice everyone).
+
+---
+
+## D25 — Similarity between generated voices is acceptable
+
+**Date:** 2026-10-28 · **Status:** accepted (owner direction)
+
+DiceBear produces avatars that occasionally look alike, and that is fine. Voices are the same: two NPCs may land close together, and some will sound similar. That is a real-world property of a cast, not a defect.
+
+**Therefore we will not build:**
+
+- collision avoidance or seed-spreading in parameter space,
+- perceptual-distance metrics used as a gate,
+- dedupe or "unique voice" guarantees,
+- re-rolling a seed because it resembles another NPC.
+
+**What still matters:**
+
+- **Determinism** (D24) — a seed must always produce the same voice; that is the contract the artist and the save file depend on.
+- **Plausibility** (D22/D1) — a generated voice must stay inside the human envelope and the validated transform region. Overlap is fine; chipmunks are not.
+- **Variety at the cast level** — the generator should span the space well enough that a screen of NPCs feels varied. Measured as coverage of archetypes and pitch range, never as pairwise uniqueness.
+
+**Consequence for the plan:** V-01's archetype-separation test is relaxed to "archetypes are recognisably different *on average*", and no downstream task may require distinctness. The NPC grid demo exists to show variety, not to certify it.
+
+---
+
+## How to change a decision
+
 1. Write the proposed change in a new entry (do not edit history).
 2. State what evidence forces it (a spike result, a metric, a human round).
 3. Update PLAN.md's decision table and any affected acceptance criteria in the same commit.

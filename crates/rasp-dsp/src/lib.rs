@@ -29,6 +29,10 @@
 //!   measurement it runs on (PLAN P-05b): effective = nominal × `w`, where `w`
 //!   falls to 0 as a clip's measured median F0 approaches the corpus envelope
 //!   edge (79–323 Hz) in the requested direction.
+//! * [`variant`] — the seeded `(base_voice, npc_seed) → parameter set` generator
+//!   (PLAN V-01, D23/D24): integer SplitMix64 draws, quantised steps, a
+//!   versioned schema and twelve archetypes clamped to D1's validated region.
+//!   Headroom is deliberately **not** applied here (D22 owns it per clip).
 //!
 //! # Pitch shifting (P-02)
 //!
@@ -69,6 +73,7 @@ pub mod pitch;
 pub mod resample;
 pub mod stft;
 pub mod transform;
+pub mod variant;
 
 #[cfg(test)]
 mod testutil;
@@ -109,4 +114,9 @@ pub use transform::{
     CorrectionWindowPolicy, VoiceTransformConfig, VoiceTransformError, VoiceTransformer,
     DEFAULT_CORRECTION_WINDOW, MAX_FORMANT_RATIO, MAX_TILT_DB_PER_OCT, MIN_FORMANT_RATIO,
     MIN_TILT_DB_PER_OCT, TILT_REFERENCE_HZ, WIDE_CORRECTION_F0_HZ, WIDE_CORRECTION_WINDOW,
+};
+pub use variant::{
+    derive, derive_with_schema, Archetype, ArchetypeNominal, VariantError, VariantSpec,
+    FORMANT_JITTER_STEPS, FORMANT_STEP, PITCH_JITTER_STEPS, PITCH_STEP, TILT_JITTER_STEPS,
+    TILT_STEP, VARIANT_SCHEMA,
 };
