@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rasp_dsp::NaturalParams;
+use rasp_dsp::{HeadroomReport, NaturalParams};
 
 use crate::audio::OutFormat;
 use crate::json::escape;
@@ -31,8 +31,10 @@ pub struct RenderRecord {
     pub language: Option<String>,
     /// `natural`, a preset id, or `custom` when an override changed the point.
     pub label: String,
-    /// The exact operating point used.
+    /// The nominal operating point (the preset / knob values).
     pub params: NaturalParams,
+    /// The D22 headroom mapping actually applied to this render.
+    pub headroom: HeadroomReport,
     /// Whether the P-08 loudness stage ran.
     pub loudness: bool,
     /// Whether endpoint trimming ran before the render.
@@ -134,6 +136,21 @@ impl RenderRecord {
         ));
         out.push('}');
         out.push(',');
+        out.push_str("\"headroom\":{");
+        out.push_str(&format!(
+            "\"mode\":\"{}\",\"weight\":{:.6},\"measuredF0Hz\":{},\"effectivePitchSt\":{:.6},\"effectiveFormantRatio\":{:.6},\"effectiveTiltDbPerOct\":{:.6}",
+            self.headroom.mode.id(),
+            f64::from(self.headroom.weight),
+            match self.headroom.measured_f0_hz {
+                Some(hz) => format!("{:.4}", f64::from(hz)),
+                None => "null".to_string(),
+            },
+            f64::from(self.headroom.effective_pitch_st()),
+            f64::from(self.headroom.effective_formant_ratio()),
+            f64::from(self.headroom.effective_tilt_db_per_oct()),
+        ));
+        out.push('}');
+        out.push(',');
         push_field(&mut out, "\"format\"", &escape(self.format.id()));
         out.push(',');
         out.push_str(&format!("\"loudness\":{}", self.loudness));
@@ -204,6 +221,23 @@ impl RenderRecord {
             on_off(self.trim)
         ));
         text.push_str(&format!(
+            "headroom w={:.3}  f0={}  -> pitch {:+.2} st  formant {:.3}x  tilt {:+.2} dB/oct{}  mode={}\n",
+            self.headroom.weight,
+            match self.headroom.measured_f0_hz {
+                Some(hz) => format!("{hz:.1} Hz"),
+                None => "unmeasured".to_string(),
+            },
+            self.headroom.effective_pitch_st(),
+            self.headroom.effective_formant_ratio(),
+            self.headroom.effective_tilt_db_per_oct(),
+            if self.headroom.no_headroom() {
+                "  (no headroom)"
+            } else {
+                ""
+            },
+            self.headroom.mode.id(),
+        ));
+        text.push_str(&format!(
             "out     {}  {} samples ({:.3} s)  {}  {} B\n",
             display(&self.path),
             self.samples_out,
@@ -230,7 +264,7 @@ impl RenderRecord {
     /// The one-line form used inside a batch.
     pub fn to_batch_line(&self) -> String {
         format!(
-            "{:<28} {:<10} in {:>7} out {:>7}  peak {:+6.2}  tp {:+6.2}  d {:+.2} dB  {:>7.2} ms  -> {}",
+            "{:<28} {:<10} in {:>7} out {:>7}  peak {:+6.2}  tp {:+6.2}  d {:+.2} dB  w {:.2}  {:>7.2} ms  -> {}",
             self.fixture.as_deref().unwrap_or("-"),
             self.label,
             self.samples_in,
@@ -238,6 +272,7 @@ impl RenderRecord {
             self.peak_dbfs,
             self.true_peak_dbtp,
             self.level_delta_db,
+            self.headroom.weight,
             self.render_ms,
             display(&self.path)
         )
@@ -397,6 +432,11 @@ mod tests {
             language: Some("en".to_string()),
             label: "deep".to_string(),
             params: NaturalParams::new(-4.0, 0.85, 0.0),
+            headroom: HeadroomReport::new(
+                rasp_dsp::HeadroomMode::On,
+                NaturalParams::new(-4.0, 0.85, 0.0),
+                Some(164.08),
+            ),
             loudness: true,
             trim: false,
             samples_in: 48_000,

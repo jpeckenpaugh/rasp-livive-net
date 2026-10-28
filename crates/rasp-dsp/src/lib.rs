@@ -25,6 +25,10 @@
 //!   and the complete natural chain (PLAN P-05).
 //! * [`loudness`] — whole-clip RMS match plus a 4× true-peak limiter (PLAN P-08),
 //!   written as a reusable stage for D8's robot chain.
+//! * [`headroom`] — the D22 headroom-proportional preset strength and the F0
+//!   measurement it runs on (PLAN P-05b): effective = nominal × `w`, where `w`
+//!   falls to 0 as a clip's measured median F0 approaches the corpus envelope
+//!   edge (79–323 Hz) in the requested direction.
 //!
 //! # Pitch shifting (P-02)
 //!
@@ -58,6 +62,7 @@
 
 pub mod endpoints;
 pub mod envelope;
+pub mod headroom;
 pub mod loudness;
 pub mod params;
 pub mod pitch;
@@ -79,6 +84,10 @@ pub use envelope::{
     DEFAULT_TEMPORAL_SMOOTHING_SECONDS, DEFAULT_TRUE_ENVELOPE_PASSES, MAX_WARP_RATIO,
     MIN_WARP_RATIO,
 };
+pub use headroom::{
+    headroom_weight, median_f0_hz, room_down_hz, room_up_hz, scale_params, F0Tracker, HeadroomMode,
+    HeadroomReport, HEADROOM_HIGH_HZ, HEADROOM_LOW_HZ, HEADROOM_REFERENCE_HZ,
+};
 pub use loudness::{
     dbfs, dbtp, match_rms_to, rms, rms_dbfs, sample_peak, true_peak, true_peak_dbtp,
     LoudnessConfig, LoudnessError, LoudnessReport, LoudnessStage, TruePeakMeter,
@@ -86,8 +95,9 @@ pub use loudness::{
     DEFAULT_RELEASE_SECONDS, TRUE_PEAK_OVERSAMPLE,
 };
 pub use params::{
-    tilt_db_at, NaturalParams, NaturalPreset, NaturalRenderError, NaturalRenderer, ParamSmoother,
-    DEFAULT_SMOOTHING_SECONDS, MAX_PITCH_ST, MIN_PITCH_ST, NEPERS_PER_DB,
+    tilt_db_at, NaturalParams, NaturalPreset, NaturalRenderError, NaturalRenderReport,
+    NaturalRenderer, ParamSmoother, DEFAULT_SMOOTHING_SECONDS, MAX_PITCH_ST, MIN_PITCH_ST,
+    NEPERS_PER_DB,
 };
 pub use pitch::{
     PitchShiftConfig, PitchShiftError, PitchShifter, TransientPolicy, WindowPolicy, MAX_RATIO,

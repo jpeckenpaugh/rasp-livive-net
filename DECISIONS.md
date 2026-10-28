@@ -339,7 +339,37 @@ Absolute per-voice formant baselines are unmeasurable on this corpus (0 of 36 fi
 
 ---
 
-## How to change a decision
+## D22 — Preset strength is proportional to the headroom that voice actually has
+
+**Date:** 2026-10-28 · **Status:** accepted (owner listening feedback + measurement)
+
+**The complaint.** "A deep voice should not be pushed deeper, and a high voice should not be pushed higher."
+
+**It is measurable.** Presets are fixed-direction pushes that ignore where the voice already sits. Against the corpus's own measured F0 envelope (79–323 Hz over 54 voices, median 178 Hz):
+
+| Preset | Nominal | Voices outside the envelope | Worst case |
+|---|---|---|---|
+| `shift-up` | +7 st (×1.50) | **16 / 54 above 323 Hz** | `bf_alice` 248 → **372 Hz**; max 484 Hz |
+| `deep` | −4 st (×0.79) | **3 / 54 below 79 Hz** | `am_onyx` 88 → **70 Hz**; `bm_lewis` 79 → 63 |
+| `shift-down` | −3 st (×0.84) | 3 / 54 below | `jm_kumo` 86 → 68 |
+
+It is **not** "presets are too strong in general": the median voice under `shift-up` lands at 267 Hz, the 90th percentile of the corpus — aggressive but inside the population. The failures are purely directional headroom at the extremes.
+
+**Decision.** Effective shift = nominal × `w`, where
+
+```
+room_up(f)   = 12·log2(HI / f)        HI = 323 Hz
+room_down(f) = 12·log2(f / LO)        LO =  79 Hz
+w            = clamp(room_direction(f) / room_direction(178 Hz), 0, 1)
+```
+
+`f` is the clip's measured median F0 (±3% required), 178 Hz is the corpus median, and the bounds are the corpus's measured envelope — documented as a population envelope, **not** physiology. The same `w` scales the formant log-ratio and tilt, so a voice with no room does not get a tract change either.
+
+**Consequence.** For the deepest voice, `deep` becomes essentially a no-op (−0.55 st at 88 Hz, w 0.14); for the highest, `shift-up` becomes a no-op. Mid voices keep the full nominal shift. The UI must show this honestly ("no headroom") rather than silently applying nothing.
+
+*Rejected:* a global strength reduction (leaves the extremes broken and weakens the middle), a hard clamp at the bounds (voices bunch against the wall), an absolute target percentile (makes `shift-up` inert for every female voice, ~half the cast).
+
+*Reopen if:* HR-2 shows the middle of the range is also too strong — then reduce the nominal strengths, not the mapping.
 
 1. Write the proposed change in a new entry (do not edit history).
 2. State what evidence forces it (a spike result, a metric, a human round).

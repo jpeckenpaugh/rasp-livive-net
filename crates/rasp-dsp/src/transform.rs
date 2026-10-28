@@ -60,20 +60,18 @@
 //!
 //! The estimate is a **proxy**: a constant pitch ratio scales every frequency
 //! exactly, so the shifted output's F0 is `ratio × input F0`. The proxy measures
-//! the **input** F0 — always inside 2048's well-resolved 79–323 Hz band — and
-//! multiplies by the ratio. That is far more reliable than trying to measure
+//! the **input** F0 — always inside the well-resolved 79–323 Hz corpus band —
+//! and multiplies by the ratio. That is far more reliable than trying to measure
 //! 40–60 Hz with a 42.7 ms window, which is the very condition that needs the
-//! wider window. Per frame it takes the normalised autocorrelation of the
-//! frame's power spectrum (one inverse FFT per sampled frame, at most 64 frames
-//! per render), corrects the periodic-Hann taper bias exactly, and picks the
-//! peak in a 40–700 Hz lag band with parabolic interpolation. Frames below
-//! −40 dB relative to the loudest analysed frame are skipped; the input-side
-//! estimate is the **median** over the rest (D17/Q-01's medians-only rule), and
-//! the reported proxy is that median times the ratio. On synthetic vowels with a
-//! known F0 it is accurate to under 0.1%; on real speech it tracks the corpus
-//! medians within a few Hz (`f0_proxy_matches_synthetic_and_fixture_medians`).
-//! When the estimate is unavailable (silence, no periodic frames) the default
-//! 2048 window is used. The proxy never alters audio: a wrong window costs
+//! wider window. The measurement is [`crate::headroom::median_f0_hz`], the same
+//! one D22 uses for preset strength: 2048-sample frames, linear autocorrelation
+//! by zero-padded FFT, the first strong peak in a 55–450 Hz band with parabolic
+//! refinement, and the **median** over loud, voiced frames (D17/Q-01's
+//! medians-only rule). On synthetic vowels with a known F0 it is accurate to
+//! under 0.2 %; on the 12 fixtures it is within **2.2 % median / 8.4 % worst**
+//! of the official D17 ruler's per-clip medians (see `docs/presets.md`). When
+//! the estimate is unavailable (silence, no periodic frames) the default 2048
+//! window is used. The proxy never alters audio: a wrong window costs
 //! resolution or CPU, never a sample of gain.
 //!
 //! [`VoiceTransformer::correction_window_size`] reports the window of the last
@@ -176,7 +174,7 @@ use std::fmt;
 
 use crate::envelope::{EnvelopeAnalyzer, EnvelopeConfig, EnvelopeError, SpectralEnvelope};
 use crate::pitch::{PitchShiftConfig, PitchShiftError, PitchShifter};
-use crate::stft::{Complex, RealFft, Spectrogram, Stft, StftConfig, StftError};
+use crate::stft::{Spectrogram, Stft, StftConfig, StftError};
 
 /// Lowest formant ratio accepted (PLAN D1 / P-03).
 pub const MIN_FORMANT_RATIO: f32 = 0.75;
@@ -218,18 +216,6 @@ pub const WIDE_CORRECTION_WINDOW: usize = 4096;
 /// estimator margin above that floor so a borderline estimate errs wide (more
 /// resolution, never less).
 pub const WIDE_CORRECTION_F0_HZ: f32 = 100.0;
-
-/// Lag band of the window-sizing F0 proxy, in Hz.
-const F0_PROXY_MIN_HZ: f32 = 40.0;
-/// Upper lag-band edge. Well above the corpus's 323 Hz input and the ±12 st
-/// output range's top, so the proxy is not band-limited by the product range.
-const F0_PROXY_MAX_HZ: f32 = 700.0;
-/// A frame must be within this power ratio of the loudest analysed frame.
-const F0_PROXY_POWER_FLOOR: f32 = 1e-4;
-/// At most this many frames are analysed (evenly spaced across the clip).
-const F0_PROXY_MAX_FRAMES: usize = 64;
-/// Minimum normalised autocorrelation peak for a frame to contribute.
-const F0_PROXY_VOICING: f32 = 0.3;
 
 /// How [`VoiceTransformer`] sizes the correction pass's analysis window (D19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -319,201 +305,6 @@ impl From<StftError> for VoiceTransformError {
     }
 }
 
-/// Window-sizing F0 proxy for the correction pass (D19).
-///
-/// This is deliberately not a general-purpose pitch tracker: it answers one
-/// question — is the shifted output's typical F0 below
-/// [`WIDE_CORRECTION_F0_HZ`]? — and never touches the audio. Per analysed frame
-/// it takes the normalised autocorrelation of the frame's power spectrum (one
-/// inverse real FFT), picks the highest peak in the 40–700 Hz lag band with
-/// parabolic interpolation, and reports the **median** across up to
-/// [`F0_PROXY_MAX_FRAMES`] evenly spaced, sufficiently loud frames.
-struct F0Estimator {
-    fft: RealFft,
-    window_size: usize,
-    /// Frame power spectrum, `N/2 + 1` real-valued bins.
-    power: Vec<Complex>,
-    /// Autocorrelation of the current frame, `N` samples.
-    autocorrelation: Vec<f32>,
-    /// Power of every frame in the analysed spectrogram.
-    frame_power: Vec<f32>,
-}
-
-impl F0Estimator {
-    fn new(window_size: usize) -> Self {
-        F0Estimator {
-            fft: RealFft::new(window_size),
-            window_size,
-            power: vec![Complex::ZERO; window_size / 2 + 1],
-            autocorrelation: vec![0.0; window_size],
-            frame_power: Vec::new(),
-        }
-    }
-
-    fn reset(&mut self, window_size: usize) {
-        if window_size == self.window_size {
-            return;
-        }
-        *self = F0Estimator::new(window_size);
-    }
-
-    /// Median F0 over the loud, periodic frames of `spectrogram`, or `None`.
-    fn estimate_median(&mut self, spectrogram: &Spectrogram, sample_rate: u32) -> Option<f32> {
-        let frames = spectrogram.frames();
-        let bins = spectrogram.bins();
-        if sample_rate == 0 || frames == 0 || bins == 0 {
-            return None;
-        }
-        self.reset(spectrogram.window_size());
-        if bins != self.power.len() {
-            self.power.resize(bins, Complex::ZERO);
-        }
-
-        self.frame_power.clear();
-        self.frame_power.reserve(frames);
-        let mut loudest = 0.0f32;
-        for frame in spectrogram.frames_iter() {
-            let mut power = 0.0f32;
-            for bin in frame {
-                power += bin.magnitude_sq();
-            }
-            self.frame_power.push(power);
-            if power > loudest {
-                loudest = power;
-            }
-        }
-        if !loudest.is_finite() || loudest <= 0.0 {
-            return None;
-        }
-        let floor = loudest * F0_PROXY_POWER_FLOOR;
-
-        let bin_hz = sample_rate as f32 / self.window_size as f32;
-        let first_bin = ((F0_PROXY_MIN_HZ * 0.5) / bin_hz).ceil() as usize;
-        let skip_bins = first_bin.min(bins);
-
-        let low_lag = (sample_rate as f32 / F0_PROXY_MAX_HZ).floor().max(2.0) as usize;
-        let high_lag =
-            ((sample_rate as f32 / F0_PROXY_MIN_HZ).ceil() as usize).min(self.window_size * 3 / 5);
-        if high_lag <= low_lag + 2 {
-            return None;
-        }
-
-        let stride = frames.div_ceil(F0_PROXY_MAX_FRAMES).max(1);
-        let mut estimates = Vec::with_capacity(F0_PROXY_MAX_FRAMES);
-        for frame in (0..frames).step_by(stride) {
-            let Some(power) = self.frame_power.get(frame).copied() else {
-                continue;
-            };
-            if power < floor {
-                continue;
-            }
-            let Some(bins_frame) = spectrogram.frame(frame) else {
-                continue;
-            };
-            for (index, (slot, bin)) in self.power.iter_mut().zip(bins_frame).enumerate() {
-                *slot = if index < skip_bins {
-                    Complex::ZERO
-                } else {
-                    Complex::new(bin.magnitude_sq(), 0.0)
-                };
-            }
-            self.fft.inverse(&self.power, &mut self.autocorrelation);
-            let zero_lag = self.autocorrelation[0];
-            if !zero_lag.is_finite() || zero_lag <= 1e-20 {
-                continue;
-            }
-            let Some(lag) = best_lag(&self.autocorrelation, low_lag, high_lag, self.window_size)
-            else {
-                continue;
-            };
-            let peak = corrected_correlation(&self.autocorrelation, lag, self.window_size);
-            if peak / zero_lag < F0_PROXY_VOICING {
-                continue;
-            }
-            let offset = parabolic_offset(
-                corrected_correlation(&self.autocorrelation, lag - 1, self.window_size),
-                peak,
-                corrected_correlation(&self.autocorrelation, lag + 1, self.window_size),
-            );
-            let refined = lag as f32 + offset;
-            if refined <= 0.0 {
-                continue;
-            }
-            let f0 = sample_rate as f32 / refined;
-            if f0.is_finite() && f0 > 0.0 {
-                estimates.push(f0);
-            }
-        }
-        median(&mut estimates)
-    }
-}
-
-/// Taper bias of the circular autocorrelation of a periodic-Hann window at
-/// `lag`, relative to lag zero.
-///
-/// The STFT frame is multiplied by a periodic Hann window, so its power-spectrum
-/// autocorrelation is `Σ w[n]w[n+τ]x[n]x[n+τ]`, whose envelope falls with
-/// `τ` and would bias the peak towards short lags (high F0). For a periodic Hann
-/// the discrete sum is exactly `(N/8)(2 + cos(2πτ/N))`, so dividing by this
-/// ratio removes the bias. Floored so a lag near `N/2` cannot blow up.
-fn window_bias(lag: usize, window_size: usize) -> f32 {
-    if window_size == 0 {
-        return 1.0;
-    }
-    let angle = 2.0 * core::f64::consts::PI * lag as f64 / window_size as f64;
-    let bias = ((2.0 + angle.cos()) / 3.0) as f32;
-    bias.max(0.1)
-}
-
-fn corrected_correlation(autocorrelation: &[f32], lag: usize, window_size: usize) -> f32 {
-    if lag == 0 || lag >= autocorrelation.len() {
-        return 0.0;
-    }
-    autocorrelation[lag] / window_bias(lag, window_size)
-}
-
-/// Index of the highest taper-corrected autocorrelation in `[low, high]`.
-fn best_lag(autocorrelation: &[f32], low: usize, high: usize, window_size: usize) -> Option<usize> {
-    let high = high.min(autocorrelation.len().saturating_sub(2));
-    if high <= low || low == 0 {
-        return None;
-    }
-    let mut best = low;
-    let mut best_value = f32::NEG_INFINITY;
-    for lag in low..=high {
-        let value = corrected_correlation(autocorrelation, lag, window_size);
-        if value > best_value {
-            best_value = value;
-            best = lag;
-        }
-    }
-    Some(best)
-}
-
-/// Parabolic peak offset in samples, clamped to half a sample.
-fn parabolic_offset(left: f32, centre: f32, right: f32) -> f32 {
-    let denominator = left - 2.0 * centre + right;
-    if denominator.abs() <= 1e-12 || !denominator.is_finite() {
-        return 0.0;
-    }
-    (0.5 * (left - right) / denominator).clamp(-0.5, 0.5)
-}
-
-/// Median of a finite-value list, averaging the two middle values when even.
-fn median(values: &mut [f32]) -> Option<f32> {
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-    let middle = values.len() / 2;
-    let value = if values.len().is_multiple_of(2) {
-        0.5 * (values[middle - 1] + values[middle])
-    } else {
-        values[middle]
-    };
-    value.is_finite().then_some(value)
-}
-
 /// Independent pitch and formant control (D1).
 ///
 /// ```
@@ -538,8 +329,6 @@ pub struct VoiceTransformer {
     /// **pitch-shifted output** via [`CorrectionWindowPolicy`] (D19) and is
     /// independent of the pitch shifter's window.
     stft: Stft,
-    /// Window-sizing F0 proxy for the shifted output (D19).
-    f0: F0Estimator,
     /// F0 proxy used for the most recent render, for reporting and tests.
     correction_f0: Option<f32>,
     /// Analysis of the input (target-envelope source).
@@ -607,7 +396,6 @@ impl VoiceTransformer {
             tilt_db_per_oct: 0.0,
             analyzer,
             stft,
-            f0: F0Estimator::new(window_size),
             correction_f0: None,
             input_spectrogram: Spectrogram::new(0, bins, window_size / 4, window_size),
             shifted_spectrogram: Spectrogram::new(0, bins, window_size / 4, window_size),
@@ -919,9 +707,7 @@ impl VoiceTransformer {
             CorrectionWindowPolicy::Auto => {
                 self.ensure_stft(DEFAULT_CORRECTION_WINDOW)?;
                 self.stft.analyze_into(input, &mut self.input_spectrogram);
-                let input_f0 = self
-                    .f0
-                    .estimate_median(&self.input_spectrogram, self.sample_rate);
+                let input_f0 = crate::headroom::median_f0_hz(input, self.sample_rate);
                 let shifted_f0 = input_f0.map(|f0| f0 * self.pitch.ratio());
                 self.correction_f0 = shifted_f0;
                 if shifted_f0.is_some_and(|value| value < WIDE_CORRECTION_F0_HZ) {
@@ -942,7 +728,6 @@ impl VoiceTransformer {
             return Ok(());
         }
         self.stft = Stft::new(StftConfig::new(window_size, window_size / 4))?;
-        self.f0 = F0Estimator::new(window_size);
         Ok(())
     }
 

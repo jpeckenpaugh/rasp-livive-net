@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rasp_dsp::{
-    dbfs, detect_endpoints, rms_dbfs, sample_peak, trim_clip, true_peak_dbtp, EndpointConfig,
-    LoudnessConfig, LoudnessReport, NaturalParams, NaturalPreset, NaturalRenderer,
-    VoiceTransformConfig, VoiceTransformer, MAX_FORMANT_RATIO, MAX_PITCH_ST, MAX_TILT_DB_PER_OCT,
-    MIN_FORMANT_RATIO, MIN_PITCH_ST, MIN_TILT_DB_PER_OCT,
+    dbfs, detect_endpoints, headroom::HeadroomReport, median_f0_hz, rms_dbfs, sample_peak,
+    trim_clip, true_peak_dbtp, EndpointConfig, HeadroomMode, LoudnessConfig, NaturalParams,
+    NaturalPreset, NaturalRenderer, VoiceTransformConfig, VoiceTransformer, MAX_FORMANT_RATIO,
+    MAX_PITCH_ST, MAX_TILT_DB_PER_OCT, MIN_FORMANT_RATIO, MIN_PITCH_ST, MIN_TILT_DB_PER_OCT,
 };
 
 use crate::args::{self, Parsed, Spec};
@@ -40,6 +40,7 @@ const RENDER_VALUES: &[&str] = &[
     "--tilt",
     "--format",
     "--loudness",
+    "--headroom",
 ];
 const RENDER_FLAGS: &[&str] = &["--trim", "--json"];
 
@@ -51,6 +52,7 @@ const BATCH_VALUES: &[&str] = &[
     "--out-dir",
     "--format",
     "--loudness",
+    "--headroom",
     "--input",
 ];
 const BATCH_FLAGS: &[&str] = &["--all", "--trim", "--json"];
@@ -85,6 +87,7 @@ pub fn render(tokens: &[String]) -> Result<()> {
     let choice = resolve_params(&parsed)?;
     let format = parse_format(&parsed, OutFormat::Wav16)?;
     let loudness = parse_loudness(&parsed, true)?;
+    let headroom = parse_headroom(&parsed)?;
     let trim = parsed.flag("--trim");
     let as_json = parsed.flag("--json");
 
@@ -116,7 +119,7 @@ pub fn render(tokens: &[String]) -> Result<()> {
     };
     let samples_in = samples.len();
 
-    let rendered = render_samples(&samples, choice.params, loudness)?;
+    let rendered = render_samples(&samples, choice.params, loudness, headroom)?;
 
     let write_start = Instant::now();
     let bytes = audio::encode(&rendered.samples, format)?;
@@ -131,6 +134,7 @@ pub fn render(tokens: &[String]) -> Result<()> {
         language: None,
         label: choice.label,
         params: choice.params,
+        headroom: rendered.headroom,
         loudness,
         trim,
         source_samples,
@@ -191,6 +195,7 @@ pub fn batch(tokens: &[String]) -> Result<()> {
     let presets = parse_presets(&parsed)?;
     let format = parse_format(&parsed, OutFormat::RawF32)?;
     let loudness = parse_loudness(&parsed, true)?;
+    let headroom = parse_headroom(&parsed)?;
     let trim = parsed.flag("--trim");
     let as_json = parsed.flag("--json");
     let input_pref = parse_input_pref(&parsed)?;
@@ -209,7 +214,7 @@ pub fn batch(tokens: &[String]) -> Result<()> {
     let mut records: Vec<RenderRecord> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     let mut table = String::from(
-        "fixture\tstep\tcents\tratio\tpreset\tpitch_st\tformant\ttilt_db_per_oct\tfile\tsamples\tpeak_dbfs\ttrue_peak_dbtp\tlevel_delta_db\tlanguage\n",
+        "fixture\tstep\tcents\tratio\tpreset\tpitch_st\tformant\ttilt_db_per_oct\tnominal_pitch_st\tnominal_formant\tweight\tf0_hz\tfile\tsamples\tpeak_dbfs\ttrue_peak_dbtp\tlevel_delta_db\tlanguage\n",
     );
 
     for clip in &selected {
@@ -223,6 +228,7 @@ pub fn batch(tokens: &[String]) -> Result<()> {
                 label: preset.id(),
                 format,
                 loudness,
+                headroom,
                 trim,
                 out_dir: &out_dir,
             }) {
@@ -297,6 +303,7 @@ struct BatchArgs<'a> {
     label: &'a str,
     format: OutFormat,
     loudness: bool,
+    headroom: HeadroomMode,
     trim: bool,
     out_dir: &'a Path,
 }
@@ -329,7 +336,7 @@ fn batch_one(args: BatchArgs<'_>) -> Result<RenderRecord> {
         loaded.input.samples
     };
     let samples_in = samples.len();
-    let rendered = render_samples(&samples, args.params, args.loudness)?;
+    let rendered = render_samples(&samples, args.params, args.loudness, args.headroom)?;
 
     let path = args.out_dir.join(format!(
         "{}.{}.{}",
@@ -350,6 +357,7 @@ fn batch_one(args: BatchArgs<'_>) -> Result<RenderRecord> {
         language: Some(args.clip.language.clone()),
         label: args.label.to_string(),
         params: args.params,
+        headroom: rendered.headroom,
         loudness: args.loudness,
         trim: args.trim,
         source_samples,
@@ -362,10 +370,16 @@ fn batch_one(args: BatchArgs<'_>) -> Result<RenderRecord> {
 }
 
 /// The columns `scripts/metrics.py --renders --manifest` consumes, plus the
-/// P-08 report fields. `ratio` is the **pitch** ratio (metrics' meaning);
-/// the formant ratio is `formant`.
+/// P-08 report fields and the D22 mapping.
+///
+/// `step`/`cents`/`ratio`/`pitch_st`/`formant`/`tilt_db_per_oct` describe the
+/// **effective** render, so the ruler scores what was actually applied.
+/// `nominal_pitch_st`/`nominal_formant` are the preset point and `weight`/`f0_hz`
+/// are D22's `w` and the measurement behind it. With `--headroom off` the two
+/// pitch/formant pairs are identical.
 fn manifest_row(record: &RenderRecord) -> String {
-    let params = record.params;
+    let effective = record.headroom.effective;
+    let nominal = record.params;
     let file = record
         .path
         .file_name()
@@ -373,15 +387,23 @@ fn manifest_row(record: &RenderRecord) -> String {
         .unwrap_or_default();
     let fixture = record.fixture.as_deref().unwrap_or("");
     let language = record.language.as_deref().unwrap_or("");
-    let step = params.pitch_st.round() as i32;
+    let step = effective.pitch_st.round() as i32;
+    let f0 = record
+        .headroom
+        .measured_f0_hz
+        .map(|hz| format!("{hz:.4}"))
+        .unwrap_or_else(|| "null".to_string());
     format!(
-        "{fixture}\t{step:+}\t{:.6}\t{:.6}\t{}\t{:.4}\t{:.4}\t{:.4}\t{file}\t{}\t{:.4}\t{:.4}\t{:.4}\t{language}\n",
-        f64::from(params.pitch_st) * 100.0,
-        f64::from(params.pitch_ratio()),
+        "{fixture}\t{step:+}\t{:.6}\t{:.6}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{f0}\t{file}\t{}\t{:.4}\t{:.4}\t{:.4}\t{language}\n",
+        f64::from(effective.pitch_st) * 100.0,
+        f64::from(effective.pitch_ratio()),
         record.label,
-        params.pitch_st,
-        params.formant_ratio,
-        params.tilt_db_per_oct,
+        effective.pitch_st,
+        effective.formant_ratio,
+        effective.tilt_db_per_oct,
+        nominal.pitch_st,
+        nominal.formant_ratio,
+        record.headroom.weight,
         record.samples_out,
         record.peak_dbfs,
         record.true_peak_dbtp,
@@ -557,10 +579,17 @@ struct Rendered {
     peak_dbfs: f32,
     true_peak_dbtp: f32,
     render_ms: f64,
+    /// D22 mapping applied by this render.
+    headroom: HeadroomReport,
 }
 
 /// Run the natural chain (transform → optional P-08 loudness stage).
-fn render_samples(input: &[f32], params: NaturalParams, loudness: bool) -> Result<Rendered> {
+fn render_samples(
+    input: &[f32],
+    params: NaturalParams,
+    loudness: bool,
+    headroom: HeadroomMode,
+) -> Result<Rendered> {
     let params = params.sanitised();
     let start = Instant::now();
     let mut output = Vec::with_capacity(input.len());
@@ -572,30 +601,41 @@ fn render_samples(input: &[f32], params: NaturalParams, loudness: bool) -> Resul
             LoudnessConfig::default(),
         )
         .map_err(|err| CliError::failed(format!("cannot build the render chain: {err}")))?;
+        renderer.set_headroom(headroom);
         renderer.set_params(params);
-        let report: LoudnessReport = renderer
-            .process_into(input, &mut output)
+        let report = renderer
+            .process_into_reported(input, &mut output)
             .map_err(|err| CliError::failed(format!("render failed: {err}")))?;
         let render_ms = elapsed_ms(start);
         Ok(Rendered {
             samples: output,
-            source_rms_dbfs: report.source_rms_dbfs,
-            output_rms_dbfs: report.output_rms_dbfs,
-            level_delta_db: report.level_delta_db,
-            limiter_min_gain_db: report.limiter_min_gain_db,
-            peak_dbfs: report.output_sample_peak_dbfs,
-            true_peak_dbtp: report.output_true_peak_dbtp,
+            source_rms_dbfs: report.loudness.source_rms_dbfs,
+            output_rms_dbfs: report.loudness.output_rms_dbfs,
+            level_delta_db: report.loudness.level_delta_db,
+            limiter_min_gain_db: report.loudness.limiter_min_gain_db,
+            peak_dbfs: report.loudness.output_sample_peak_dbfs,
+            true_peak_dbtp: report.loudness.output_true_peak_dbtp,
             render_ms,
+            headroom: report.headroom,
         })
     } else {
         // `--loudness off` is the raw transform: no RMS match and no limiter.
         // `NaturalRenderer` always owns a loudness stage, so the off path uses
-        // the transform directly with the same D2 config.
+        // the transform directly with the same D2 config, and applies D22's
+        // mapping itself so `--loudness off --headroom on` behaves like the
+        // product path.
+        let measured = if headroom == HeadroomMode::On && params.pitch_st != 0.0 {
+            median_f0_hz(input, SAMPLE_RATE)
+        } else {
+            None
+        };
+        let headroom_report = HeadroomReport::new(headroom, params, measured);
+        let effective = headroom_report.effective;
         let mut transformer = VoiceTransformer::new(SAMPLE_RATE, VoiceTransformConfig::d2())
             .map_err(|err| CliError::failed(format!("cannot build the transform: {err}")))?;
-        transformer.set_pitch_semitones(params.pitch_st);
-        transformer.set_formant_ratio(params.formant_ratio);
-        transformer.set_tilt_db_per_oct(params.tilt_db_per_oct);
+        transformer.set_pitch_semitones(effective.pitch_st);
+        transformer.set_formant_ratio(effective.formant_ratio);
+        transformer.set_tilt_db_per_oct(effective.tilt_db_per_oct);
         transformer
             .process_into(input, &mut output)
             .map_err(|err| CliError::failed(format!("render failed: {err}")))?;
@@ -613,6 +653,7 @@ fn render_samples(input: &[f32], params: NaturalParams, loudness: bool) -> Resul
             peak_dbfs,
             true_peak_dbtp: true_peak,
             render_ms,
+            headroom: headroom_report,
         })
     }
 }
@@ -625,6 +666,7 @@ struct BuildArgs<'a> {
     language: Option<String>,
     label: String,
     params: NaturalParams,
+    headroom: HeadroomReport,
     loudness: bool,
     trim: bool,
     source_samples: usize,
@@ -644,6 +686,7 @@ fn build_record(args: BuildArgs<'_>) -> RenderRecord {
         language: args.language,
         label: args.label,
         params: args.params,
+        headroom: args.headroom,
         loudness: args.loudness,
         trim: args.trim,
         samples_in: args.samples_in,
@@ -745,6 +788,15 @@ fn parse_format(parsed: &Parsed, default: OutFormat) -> Result<OutFormat> {
                 "unknown --format '{text}'; expected one of: {}",
                 OutFormat::ids()
             ))
+        }),
+    }
+}
+
+fn parse_headroom(parsed: &Parsed) -> Result<HeadroomMode> {
+    match parsed.value("--headroom") {
+        None => Ok(HeadroomMode::On),
+        Some(text) => HeadroomMode::from_id(text).ok_or_else(|| {
+            CliError::usage(format!("--headroom expects 'on' or 'off', got '{text}'"))
         }),
     }
 }
@@ -1034,6 +1086,15 @@ BEHAVIOUR
   --loudness on|off      on (default) runs the P-08 policy: whole-clip RMS match
                          to the source, then a -1 dBTP true-peak limiter.
                          off is the raw transform, for measurement only.
+  --headroom on|off      on (default) scales the preset by the headroom D22 says
+                         this clip has: effective = nominal x w, where w falls
+                         to 0 as the measured median F0 approaches the corpus
+                         envelope edge (79-323 Hz) in the requested direction.
+                         Pitch, formant log-ratio and tilt all scale together.
+                         at w = 0 the preset is a bit-exact bypass and the
+                         report says \"no headroom\". off reproduces the pre-D22
+                         fixed presets for A/B. --json reports w and the
+                         effective pitch/formant/tilt.
   --json                 machine summary on stdout, human summary on stderr.
 
 EXAMPLES
@@ -1046,6 +1107,10 @@ EXAMPLES
 
   # preset plus one override: deep, but only -2 st
   rasp render --in clip.weba --preset deep --pitch -2 --out /tmp/deep2.wav
+
+  # A/B the D22 mapping: fixed nominal strength vs headroom-proportional
+  rasp render --in clip.weba --preset shift-up --headroom off --out /tmp/fixed.wav
+  rasp render --in clip.weba --preset shift-up --json --out /tmp/scaled.wav | jq .headroom
 
   # trimmed render: the output is shorter than the source
   rasp render --in clip.weba --trim --out /tmp/trimmed.wav
@@ -1087,15 +1152,22 @@ OPTIONS
   --trim                 trim endpoints before each render (output is shorter;
                          metrics then needs --allow-length-delta)
   --loudness on|off      P-08 policy (default on)
+  --headroom on|off      D22 headroom-proportional preset strength (default on);
+                         off writes the fixed nominal presets for A/B or for the
+                         D17 nominal-point matrix
   --json                 one object with every render on stdout
 
 OUTPUT
   <name>.<preset>.<ext>  one file per fixture x preset
   manifest.tsv           fixture, step, cents, ratio, preset, pitch_st,
-                         formant, tilt_db_per_oct, file, samples, peak_dbfs,
-                         true_peak_dbtp, level_delta_db, language
-                         `ratio` is the PITCH ratio (scripts/metrics.py's
-                         meaning); the formant ratio is the `formant` column.
+                         formant, tilt_db_per_oct, nominal_pitch_st,
+                         nominal_formant, weight, f0_hz, file, samples,
+                         peak_dbfs, true_peak_dbtp, level_delta_db, language
+                         `step`/`cents`/`ratio`/`pitch_st`/`formant` are the
+                         EFFECTIVE values the DSP applied, so scripts/metrics.py
+                         scores the render against the shift it actually got.
+                         `nominal_*` is the preset point and `weight` is D22's
+                         w. With --headroom off the two pairs are identical.
                          Timings are not written here: the manifest must be
                          reproducible.
 
@@ -1116,6 +1188,9 @@ EXAMPLES
 
   # the product decoder path instead of the fixture PCM
   rasp batch --all --input weba --out-dir /tmp/from-weba
+
+  # the pre-D22 fixed-strength matrix (the P-05/D17 nominal points)
+  rasp batch --all --presets all --headroom off --out-dir /tmp/nominal
 
 Note: batch renders sequentially in manifest order, so manifests and JSON are
 byte-identical between runs. Parallelism was not worth nondeterministic output.
@@ -1237,6 +1312,10 @@ mod tests {
             language: Some("en".to_string()),
             label: "shift-up".to_string(),
             params: NaturalPreset::ShiftUp.params(),
+            headroom: HeadroomReport::pass_through(
+                HeadroomMode::On,
+                NaturalPreset::ShiftUp.params(),
+            ),
             loudness: true,
             trim: false,
             samples_in: 10,
@@ -1259,8 +1338,8 @@ mod tests {
         assert_eq!(fields[1], "+7");
         assert_eq!(fields[2], "700.000000");
         assert_eq!(fields[4], "shift-up");
-        assert_eq!(fields[8], "a__b.shift-up.f32");
-        assert_eq!(fields.len(), 14);
+        assert_eq!(fields[12], "a__b.shift-up.f32");
+        assert_eq!(fields.len(), 18);
     }
 
     #[test]

@@ -38,6 +38,7 @@
 //! `scripts/.venv/bin/python scripts/metrics.py --renders <dir> --manifest <dir>/manifest.tsv --check`.
 
 use super::*;
+use crate::headroom::HeadroomMode;
 use crate::loudness::{dbfs, sample_peak, true_peak_dbtp, DEFAULT_CEILING_DBTP};
 use crate::testutil::{self, estimate_f0, Lcg};
 use std::time::Instant;
@@ -456,6 +457,10 @@ fn preset_measurement_table() {
             for f0 in F0S {
                 let input = testutil::vowel(f0, &formants, &bandwidths, SR, LEN);
                 let mut renderer = NaturalRenderer::d2(SR).expect("valid chain");
+                // This table is the evidence for the *nominal* operating point
+                // (D12/P-05); D22's per-voice scaling is measured separately in
+                // `headroom::tests::write_headroom_renders`.
+                renderer.set_headroom(HeadroomMode::Off);
                 renderer.set_preset(preset);
                 let mut output = Vec::new();
                 let report = renderer
@@ -630,6 +635,8 @@ fn preset_fixture_table() {
     for fixture in &fixtures {
         for preset in NaturalPreset::MEASURED {
             let mut renderer = NaturalRenderer::d2(SR).expect("valid chain");
+            // Nominal point; D22 scaling is a separate measurement.
+            renderer.set_headroom(HeadroomMode::Off);
             renderer.set_preset(preset);
             let mut output = Vec::new();
             let report = renderer
@@ -697,6 +704,9 @@ fn write_preset_renders() {
     let mut render_one = |name: &str, preset: NaturalPreset, input: &[f32]| {
         let point = preset.params();
         let mut renderer = NaturalRenderer::d2(SR).expect("valid chain");
+        // The D17 preset matrix is the nominal-point matrix (D12/P-05). The
+        // D22-effective matrix is written by `headroom::tests`.
+        renderer.set_headroom(HeadroomMode::Off);
         renderer.set_preset(preset);
         let output = renderer.process(input).expect("valid render");
         let step = point.pitch_st.round() as i32;
@@ -786,6 +796,10 @@ fn preset_cpu_cost() {
         let elapsed = time(NaturalRenderer::d2(SR).expect("valid"), preset);
         report(&format!("{:<11}", preset.id()), elapsed);
     }
+    let mut fixed = NaturalRenderer::d2(SR).expect("valid");
+    fixed.set_headroom(HeadroomMode::Off);
+    let elapsed = time(fixed, NaturalPreset::ShiftUp);
+    report("shift-up, headroom off", elapsed);
 
     // Isolate the loudness stage's share on a non-bypass render.
     let mut transform_only = VoiceTransformer::new(SR, VoiceTransformConfig::d2()).expect("valid");

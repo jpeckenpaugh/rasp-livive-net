@@ -14,6 +14,12 @@
 //! * [`NaturalRenderer`] — the whole chain the product plays: transform →
 //!   loudness policy ([`crate::loudness`]). It is the natural-mode composition;
 //!   the robot chain (D8) is not wired here.
+//! * The D22 **headroom mapping** ([`crate::headroom`]) is applied per clip by
+//!   [`NaturalRenderer`]: effective shift = nominal × `w`, where `w` falls to 0
+//!   as the clip's measured F0 approaches the corpus envelope edge in the
+//!   requested direction. `process_into_reported` exposes `w` and the effective
+//!   point; `set_headroom(HeadroomMode::Off)` reproduces the pre-D22 fixed
+//!   presets for A/B.
 //!
 //! # Ranges
 //!
@@ -52,6 +58,7 @@
 
 use std::fmt;
 
+use crate::headroom::{F0Tracker, HeadroomMode, HeadroomReport};
 use crate::loudness::{LoudnessConfig, LoudnessError, LoudnessReport, LoudnessStage};
 use crate::transform::{
     VoiceTransformConfig, VoiceTransformError, VoiceTransformer, MAX_FORMANT_RATIO,
@@ -561,6 +568,9 @@ impl From<LoudnessError> for NaturalRenderError {
 pub struct NaturalRenderer {
     sample_rate: u32,
     params: NaturalParams,
+    headroom: HeadroomMode,
+    headroom_report: Option<HeadroomReport>,
+    f0: F0Tracker,
     transformer: VoiceTransformer,
     loudness: LoudnessStage,
     /// Transform output, reused across renders.
@@ -572,6 +582,8 @@ impl fmt::Debug for NaturalRenderer {
         f.debug_struct("NaturalRenderer")
             .field("sample_rate", &self.sample_rate)
             .field("params", &self.params)
+            .field("headroom", &self.headroom)
+            .field("headroom_report", &self.headroom_report)
             .field("transform", &self.transformer)
             .field("loudness", &self.loudness)
             .finish_non_exhaustive()
@@ -590,6 +602,9 @@ impl NaturalRenderer {
         Ok(NaturalRenderer {
             sample_rate,
             params: NaturalParams::natural(),
+            headroom: HeadroomMode::On,
+            headroom_report: None,
+            f0: F0Tracker::new(),
             transformer,
             loudness,
             scratch: Vec::new(),
@@ -620,11 +635,33 @@ impl NaturalRenderer {
         self.transformer.set_formant_ratio(params.formant_ratio);
         self.transformer.set_tilt_db_per_oct(params.tilt_db_per_oct);
         self.params = params;
+        self.headroom_report = None;
     }
 
-    /// The operating point in use.
+    /// The operating point in use, **before** the D22 headroom mapping.
     pub fn params(&self) -> NaturalParams {
         self.params
+    }
+
+    /// Whether preset strength is scaled by the voice's measured headroom
+    /// (D22). [`HeadroomMode::On`] is the default; `Off` reproduces the
+    /// pre-D22 fixed behaviour for A/B.
+    pub fn headroom_mode(&self) -> HeadroomMode {
+        self.headroom
+    }
+
+    /// Set the headroom mode (D22). Does not render.
+    pub fn set_headroom(&mut self, mode: HeadroomMode) {
+        self.headroom = mode;
+        self.headroom_report = None;
+    }
+
+    /// The headroom report of the most recent render, if any.
+    ///
+    /// `None` before the first render and after a parameter change: effective
+    /// strength depends on the clip being rendered, not just the knobs.
+    pub fn last_headroom(&self) -> Option<HeadroomReport> {
+        self.headroom_report
     }
 
     /// Apply a preset by name (D12).
@@ -665,17 +702,70 @@ impl NaturalRenderer {
     /// The output is exactly `input.len()` samples: neither the transform nor
     /// the loudness stage trims or pads (P-03/P-08). An empty input gives an
     /// empty output and a silent report.
+    ///
+    /// This is the pre-D22 signature; it returns the loudness half of
+    /// [`process_into_reported`](Self::process_into_reported), which is what a
+    /// caller that needs `w` should use.
     pub fn process_into(
         &mut self,
         input: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<LoudnessReport, NaturalRenderError> {
+        self.process_into_reported(input, output)
+            .map(|report| report.loudness)
+    }
+
+    /// Render into an existing vector and return both reports.
+    ///
+    /// The **effective** operating point is computed for this clip: the D22
+    /// weight `w` is `1` when the mode is [`HeadroomMode::Off`], when the
+    /// nominal pitch shift is zero, or when the clip has no voiced frames; it
+    /// scales pitch, the formant log-ratio and tilt otherwise. The nominal
+    /// point stays available via [`params`](Self::params); the effective one is
+    /// in [`NaturalRenderReport::headroom`].
+    pub fn process_into_reported(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<NaturalRenderReport, NaturalRenderError> {
+        let headroom = self.resolve_headroom(input);
+        self.transformer
+            .set_pitch_semitones(headroom.effective.pitch_st);
+        self.transformer
+            .set_formant_ratio(headroom.effective.formant_ratio);
+        self.transformer
+            .set_tilt_db_per_oct(headroom.effective.tilt_db_per_oct);
+
         self.transformer.process_into(input, &mut self.scratch)?;
-        let report = self.loudness.process_into(input, &mut self.scratch);
+        let loudness = self.loudness.process_into(input, &mut self.scratch);
         output.clear();
         output.extend_from_slice(&self.scratch);
-        Ok(report)
+        self.headroom_report = Some(headroom);
+        Ok(NaturalRenderReport { loudness, headroom })
     }
+
+    /// Resolve the effective point for this clip (D22).
+    ///
+    /// The F0 measurement is skipped entirely when the mapping cannot change
+    /// anything (mode `Off`, or a zero nominal pitch): `bright` and `natural`
+    /// pay nothing for it.
+    fn resolve_headroom(&mut self, input: &[f32]) -> HeadroomReport {
+        let nominal = self.params;
+        if self.headroom == HeadroomMode::Off || nominal.pitch_st == 0.0 {
+            return HeadroomReport::pass_through(self.headroom, nominal);
+        }
+        let measured = self.f0.estimate(input, self.sample_rate);
+        HeadroomReport::new(self.headroom, nominal, measured)
+    }
+}
+
+/// The complete natural-mode report: loudness plus the D22 headroom mapping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NaturalRenderReport {
+    /// Whole-clip RMS match and true-peak limiter numbers (P-08).
+    pub loudness: LoudnessReport,
+    /// The effective-strength mapping for this clip (P-05b/D22).
+    pub headroom: HeadroomReport,
 }
 
 /// The tilt curve in decibels at `hz`, for documentation and tests.

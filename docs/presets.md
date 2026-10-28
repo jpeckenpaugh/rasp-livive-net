@@ -20,6 +20,12 @@ D12 fixes the labels; this task fixes the points. A preset is a point in D1's pi
 
 The size presets move pitch and formants **in the same direction**, which is the physically consistent one. The opposing corners are the ones D1 measured as broken and are deliberately absent.
 
+**These are nominal points, not what every voice gets.** D22 scales strength by
+the headroom the clip actually has in the requested direction, so the shipped
+shift is `nominal × w` and a deep voice is not pushed deeper. §13 is the rule,
+the per-voice table and the envelope evidence; §4–§9 below measure the **nominal**
+points, which is what `--headroom off` reproduces byte-for-byte.
+
 `shift-up` is at D1's measured upward row (`+7 st`, formant 1.00–1.10). It is the only upward operating point inside that row that clears the D17 pitch gate on 11 of 12 fixtures; `+7 / 1.25` clears all 12 but leaves the D1 row, and its formant gate instead fails 4 of 8 synthetic cells (§8).
 
 ## 2. Method, and what "measured" means
@@ -109,9 +115,13 @@ Reading the table:
 | `deep` | 12 | 8 | 16 | 0 | 4 | 2.58 | 18.93 | 0 |
 | **all** | 60 | 40 | **92** | **1** | **7** | 4.51 | 28.58 | **0** |
 
+This matrix is the **nominal** point matrix: it is reproduced exactly with
+`--headroom off` (the DSP harness sets `HeadroomMode::Off`). D22's effective
+matrix is a different set of operating points and is reported in §13.4.
+
 The `N/A` cells are the downward presets on the lowest voices: `shift-down`/−3 and `deep`/−4 take `am_onyx` (88 Hz) and `jm_kumo` (86 Hz) below the ruler's 80 Hz floor, and the 90/110 Hz synthetic vowels likewise. D17 says out-of-band is `N/A`, never `PASS`.
 
-**The one FAIL** is `shift-up` on `am_onyx__got-time`: median −0.12 c, p90 **28.58 c** (limit 25), 0 octave outliers. The same clip through the pitch shifter alone (no formant correction) reads p90 **9.9 c**, so the correction pass — not the shifter — contributes the 18.7 c of per-frame spread; at `+7 / 1.25` (outside D1's row) it drops to 21.4 c. This is recorded as an unsupported cell for the lowest male voice at `shift-up`, not as a pass. `docs/qa/round-2.md` should listen for it specifically.
+**The one FAIL** is `shift-up` on `am_onyx__got-time`: median −0.12 c, p90 **28.58 c** (limit 25), 0 octave outliers. D22 does not change this cell: `am_onyx` is the low anchor moving *up*, where it has 22.4 st of headroom, so `w = 1` (§13.4). The same clip through the pitch shifter alone (no formant correction) reads p90 **9.9 c**, so the correction pass — not the shifter — contributes the 18.7 c of per-frame spread; at `+7 / 1.25` (outside D1's row) it drops to 21.4 c. This is recorded as an unsupported cell for the lowest male voice at `shift-up`, not as a pass. `docs/qa/round-2.md` should listen for it specifically.
 
 ## 6. Fixtures: loudness and true peak
 
@@ -230,15 +240,21 @@ This is a P-03-owned change made under P-05 because the preset measurement could
 # unit + contract tests (debug, no fixtures needed; skips cleanly without them)
 cargo test -p rasp-dsp
 
-# the two measurement tables (release; ~5 s)
+# the two nominal-point measurement tables (release; ~5 s)
 cargo test -p rasp-dsp --release preset_measurement_table -- --ignored --nocapture
 cargo test -p rasp-dsp --release preset_fixture_table      -- --ignored --nocapture
 
-# the official D17 ruler over every preset × fixture × synthetic cell
+# the official D17 ruler over the nominal preset matrix (headroom off)
 cargo test -p rasp-dsp --release write_preset_renders -- --ignored --nocapture
 scripts/.venv/bin/python scripts/metrics.py \
   --renders "${TMPDIR:-/tmp}/rasp-p05-renders" \
   --manifest "${TMPDIR:-/tmp}/rasp-p05-renders/manifest.tsv" --check
+
+# the D22-effective matrix (headroom on; §13.4)
+cargo test -p rasp-dsp --release write_headroom_renders -- --ignored --nocapture
+scripts/.venv/bin/python scripts/metrics.py \
+  --renders "${TMPDIR:-/tmp}/rasp-p05b-renders" \
+  --manifest "${TMPDIR:-/tmp}/rasp-p05b-renders/manifest.tsv" --check
 
 # native CPU
 cargo test -p rasp-dsp --release preset_cpu_cost -- --ignored --nocapture
@@ -250,13 +266,14 @@ The heavy measurements are `#[ignore]`d so a debug `cargo test` stays under the 
 
 | Path | ms per second of audio | × realtime |
 |---|---|---|
-| `natural` (bit-exact bypass) | 3.4 | 290 |
-| `bright` (tilt only) | 10.4 | 96 |
-| `shift-down` | 32.4 | 31 |
-| `deep` | 31.7 | 32 |
-| `shift-up` | 36.5 | 27 |
-| `shift-up`, transform only | 33.4 | 30 |
-| loudness stage only | 3.3 | 306 |
+| `natural` (bit-exact bypass) | 3.1 | 326 |
+| `bright` (tilt only) | 11.3 | 88 |
+| `shift-down` | 32.3 | 31 |
+| `deep` | 32.6 | 31 |
+| `shift-up` | 37.4 | 27 |
+| `shift-up`, transform only | 33.6 | 30 |
+| `shift-up`, headroom off (nominal) | 36.4 | 27 |
+| loudness stage only | 3.1 | 321 |
 
 P-08 adds **≈ 3.2 ms/s** (~10 % of a shifted render, 306× realtime on its own): one 4× interpolated envelope pass plus, when the limiter engages, two linear envelope passes. P-05's tilt costs one `log2` per bin and one vector add per frame when a shift is already running; on its own (`bright`) it pays for one correction STFT/ISTFT because the tilt is applied in that domain. The dominant cost is still P-03's correction pass, as it was before.
 
@@ -266,4 +283,229 @@ P-08 adds **≈ 3.2 ms/s** (~10 % of a shifted render, 306× realtime on its own
 * **Synthetic vowels are stationary.** They isolate pitch/formant behaviour with known ground truth; they do not exercise transients, glides or codec noise. P-04's transient numbers and the fixture D17 matrix cover those, and the fit residual column is the honest warning that a stationary synthetic vowel is already outside the 3-resonator model after correction.
 * **The formant numbers are the P-03 ruler's.** It is exact on its analytic control and it reports where it is not: the three unsupported cells and the residual column. No fixture formant is published (D20).
 * **The 150 Hz cells sit at the ruler's conditioning limit**, even where they pass: `shift-up` 500/90 and 500/110 read +7.3 % with a 5.7–6.6 dB residual. Treat "passes by 0.7 %" as "inside the gate with little margin", not as a comfortable result.
-* **`shift-up`'s one D17 failure is a product caveat**: the lowest male voice (`am_onyx`, 88 Hz) at +7 st is outside the pitch gate by 3.6 c of p90. The other 11 fixtures pass.
+* **`shift-up`'s one D17 failure is a product caveat**: the lowest male voice (`am_onyx`, 88 Hz) at +7 st is outside the pitch gate by 3.6 c of p90. The other 11 fixtures pass. D22 leaves it untouched (`w = 1`), so **P-03c does not close via headroom**; the correction pass's per-frame spread is still the cause.
+* **The headroom mapping creates one new D17 cell**: `am_eric` `deep` at its effective −3.60 st has p90 27.04 c. That is a new operating point, not a moved previously-measured one (§13.4). It is the first item for the next DSP pass.
+* **The F0 estimator is 2.16 % median / 8.42 % worst** against the official per-clip ruler (§13.6). That moves `w` by at most ≈0.04, i.e. ≈0.2 st on `shift-up`, well inside the acceptance cells, but it is not exact; a future Q-01 baseline can replace the self-measured value once the per-voice file exists.
+
+## 13. Headroom-proportional strength (P-05b / D22)
+
+D22 replaces "same push for every voice" with "as much push as the voice has
+room for" in the requested direction. The nominal points in §1 are unchanged;
+this section is the mapping from nominal to **effective**.
+
+### 13.1 The rule
+
+```
+room_up(f)   = 12·log2(HI / f)      HI = 323 Hz
+room_down(f) = 12·log2(f / LO)      LO =  79 Hz
+w            = clamp(room_direction(f) / room_direction(178 Hz), 0, 1)
+
+effective_pitch_st    = nominal_pitch_st × w
+effective_formant     = nominal_formant_ratio ^ w     (ratio^w, i.e. log-ratio × w)
+effective_tilt        = nominal_tilt_db_per_oct × w
+```
+
+* `f` is **the clip's measured median F0**, not the voice's published median —
+  the same clip rendered twice gets the same `w`, and a different phrase on the
+  same voice may get a slightly different one.
+* `178 Hz` is the corpus median (`room_up(178) = 10.316 st`,
+  `room_down(178) = 14.063 st`). A median voice keeps the whole nominal shift.
+* `w` is per **direction**, from the sign of the nominal pitch. `natural` and
+  `bright` have nominal pitch 0, so there is no direction to exhaust and `w = 1`
+  trivially; `bright` keeps its +1.5 dB/oct everywhere.
+* All three axes scale together, so a voice with no room gets no tract change
+  either. At `w = 0` the render is the bit-exact bypass.
+* No measurement (silence, an unvoiced clip) falls back to `w = 1`: keep the
+  nominal preset rather than guess. `HeadroomReport::measured_f0_hz` is `None`
+  in that case, so the UI can distinguish it from "measured, full headroom".
+
+**The bounds are a population envelope, not physiology.** 79 and 323 Hz are the
+measured medians of the 54 corpus voices (`docs/corpus.md` §2), rounded. Two
+voices sit on the edges and are the reason the rule exists at the top end:
+`zm_yunxia` is 315.5 Hz **with a male label** (the label is wrong; the
+measurement is not) and `zf_xiaoyi` is 323.1 Hz; at the bottom, `bm_lewis` is
+78.9 Hz with HNR 4.9 dB. A voice outside the envelope clamps to `w = 0` in the
+outward direction — it is left alone, never pushed further out. This is
+"don't leave the cast's own range", not a claim about human vocal limits.
+
+### 13.2 Effective shift by voice
+
+Corpus voice medians; `w↑`/`w↓` are the weights for `shift-up` and the downward
+presets. `bright` is `w = 1` on every row (no pitch direction) and is omitted.
+
+| voice | lang | corpus F0 | w↑ | `shift-up` | w↓ | `shift-down` | `deep` |
+|---|---|---|---|---|---|---|---|
+| `am_onyx` | en | 88.4 | 1.000 | +7.00 | 0.138 | −0.42 | **−0.55** |
+| `af_aoede` | en | 221.3 | 0.635 | +4.44 | 1.000 | −3.00 | −4.00 |
+| `bf_alice` | en | 248.3 | 0.441 | **+3.09** | 1.000 | −3.00 | −4.00 |
+| `af_heart` | en | 214.2 | 0.689 | +4.83 | 1.000 | −3.00 | −4.00 |
+| `am_eric` | en | 161.6 | 1.000 | +7.00 | 0.881 | −2.64 | −3.52 |
+| `bf_emma` | en | 181.1 | 0.971 | +6.80 | 1.000 | −3.00 | −4.00 |
+| `zf_xiaoni` | zh | 242.1 | 0.484 | +3.39 | 1.000 | −3.00 | −4.00 |
+| `zm_yunxi` | zh | 175.0 | 1.000 | +7.00 | 0.979 | −2.94 | −3.92 |
+| `jf_nezumi` | ja | 228.3 | 0.582 | +4.08 | 1.000 | −3.00 | −4.00 |
+| `jm_kumo` | ja | 86.4 | 1.000 | +7.00 | 0.110 | −0.33 | −0.44 |
+| `hf_alpha` | hi | 239.3 | 0.503 | +3.52 | 1.000 | −3.00 | −4.00 |
+| `ef_dora` | es | 179.3 | 0.988 | +6.91 | 1.000 | −3.00 | −4.00 |
+| `zm_yunxia` | zh | 315.5 | **0.039** | +0.28 | 1.000 | −3.00 | −4.00 |
+| `zf_xiaoyi` | zh | 323.1 | **0.000** | **+0.00** | 1.000 | −3.00 | −4.00 |
+| `bm_lewis` | en | 78.9 | 1.000 | +7.00 | **0.000** | **−0.00** | **−0.00** |
+
+The two rows the owner's complaint named are the bold cells: `deep` on the
+88 Hz anchor is a no-op (−0.55 st, and −0.32 st at the clip's own measured
+84.2 Hz), and `shift-up` on the 315–323 Hz voices is 0.28 st or nothing. The
+middle keeps its nominal point: at exactly 178 Hz `w = 1.000` for both
+directions, and the measured synthetic vowel lands within 1e-4 of it.
+
+### 13.3 Envelope: 54 voices × 4 presets
+
+Analytic consequence of §13.1 applied to the 54 measured corpus medians. "Pushed
+outside" means the mapping moved a voice out of [79, 323]; the strict-bound
+count also includes the two edge voices that **start** 0.1 Hz outside the
+rounded constants (78.9 and 323.1) and are left unchanged by `w = 0`.
+
+| preset | output range | pushed outside | strictly outside (> 0.1 Hz) |
+|---|---|---|---|
+| `shift-up` | 118.2–323.1 Hz | 0 | 1 (`zf_xiaoyi`, unchanged) |
+| `shift-down` | 78.9–271.7 Hz | 0 | 1 (`bm_lewis`, unchanged) |
+| `bright` | 78.9–323.1 Hz | 0 | 2 (both edges, unchanged) |
+| `deep` | 78.9–256.4 Hz | 0 | 2 (same two, unchanged) |
+| **all 216 cells** | **78.9–323.1 Hz** | **0** | **5 boundary identity cells, all ≤ 0.1 Hz** |
+
+The empirical check on the 12 fixtures (60 rendered cells, F0 re-measured with
+the official ruler): **0/60 outside**, min **80.57 Hz** (`am_onyx` `deep`), max
+**298.38 Hz** (`af_aoede` `shift-up`). Before D22 the same corpus table had 16
+`shift-up` voices above 323 (worst `bf_alice` 248 → 372) and 3 `deep` voices
+below 79 (worst `am_onyx` 88 → 70).
+
+### 13.4 D17 on the effective matrix
+
+Both matrices use the official ruler. The nominal matrix is unchanged; the
+effective matrix is **new information at new operating points**, not a
+regression of the existing ones.
+
+| matrix | cells | PASS | FAIL | N/A | worst median | worst p90 | octave outliers |
+|---|---|---|---|---|---|---|---|
+| nominal (`--headroom off`) | 100 | 92 | 1 | 7 | 4.51 c | 28.58 c | 0 |
+| effective (D22 on) | 80 | **78** | **2** | 0 | 3.06 c | 28.58 c | 0 |
+
+* The **nominal** row is byte-for-byte the §5 result: `--headroom off` renders
+  identical audio (spot-checked `am_onyx`/`shift-up`, `am_onyx`/`deep`,
+  `bf_alice`/`shift-up`), and §5's single failure is unchanged.
+* `am_onyx`/`shift-up` is **unchanged and still FAIL** (p90 28.58 c). It is the
+  low anchor asked to go *up*, where it has 22.4 st of room, so `w = 1`; D22
+  does not touch that cell. **P-03c cannot close via headroom** — the correction
+  pass's per-frame spread is still the cause.
+* One **new** FAIL: `am_eric`/`deep` at its effective **−3.60 st / 0.86396**,
+  p90 **27.04 c** (limit 25), median −0.78 c, 0 octave outliers. This is a new
+  operating point created by the mapping, not a moved previously measured one.
+  It is also a knife-edge: the same pitch with formant **0.867** reads p90
+  **20.85 c**. A 0.3 % change in formant ratio moves p90 by 6.2 c, which is the
+  harmonic-resolution conditioning limit P-05 already documented (§3, §8), not
+  a systematic regression. It is reported, not hidden, and is the first item for
+  the next DSP pass.
+* All 32 synthetic cells (8 vowels × 4 presets; 90/110/150/220 Hz) PASS in the
+  effective matrix.
+
+### 13.5 Formant cells where `w = 1`
+
+The P-05 formant table (§4) remains the evidence for the **nominal** points and
+is reproduced with `--headroom off`. Where D22 clamps `w = 1` the mapping is a
+no-op, proven two ways:
+
+* **Full-headroom cells** render **bit-identically** with the mapping on and
+  off: `shift-up` @ 110 Hz, `shift-down` @ 220 Hz, `deep` @ 220 Hz,
+  `bright` @ 150 Hz.
+* **At exactly 178 Hz** the estimator lands within 1e-4 of the reference, so
+  `w = 1` to float precision and the on/off render null is **−122 dB**
+  (`shift-down`, `deep`) to **−234 dB** (`shift-up`, `bright`).
+
+Synthetic cells at extreme F0 do get `w < 1`; their effective points are:
+
+| preset | 90 Hz | 110 Hz | 150 Hz | 220 Hz |
+|---|---|---|---|---|
+| `shift-up` | +7.00 / 1.100 | +7.00 / 1.100 | +7.00 / 1.100 | **+4.51 / 1.063** |
+| `shift-down` | **−0.48 / 0.980** | **−1.22 / 0.949** | **−2.37 / 0.904** | −3.00 / 0.880 |
+| `deep` | **−0.64 / 0.974** | **−1.63 / 0.936** | **−3.16 / 0.880** | −4.00 / 0.850 |
+
+(effective semitones / effective formant ratio). Their formant errors are not
+compared against the nominal targets — they are different operating points — and
+D17 scores all of them PASS. Re-measuring formants at each effective point is
+Q-02 work, not a claim this task makes.
+
+### 13.6 The F0 estimator
+
+`correction_f0_hz()` and D22 share one measurement,
+`rasp_dsp::headroom::median_f0_hz`. The old window-sizing proxy — normalized
+autocorrelation of each frame's **power spectrum**, global maximum in 40–700 Hz —
+read `am_onyx` 96.7 Hz against an 88.4 Hz corpus median (+9.4 %) and ranged
+−8.2…+9.4 % over the fixtures. The replacement uses 2048-sample frames, linear
+autocorrelation by zero-padded FFT, the **first** local maximum reaching 92 % of
+the best peak (which rejects the subharmonic peak a global maximum picks), and
+the median over loud, voiced frames. It is exact (< 0.01 %) on synthetic vowels.
+
+Errors are shown against the **official D17 ruler's per-clip median** and, for
+context, the corpus **voice** median. The per-clip reference is the right target
+for D22: a fixture is one phrase, a voice median pools 26. `am_onyx`'s own
+fixture reads 82.27 Hz under the official ruler versus an 88.4 Hz voice median
+— a 7 % difference that no estimator can remove.
+
+| fixture | `median_f0_hz` | ruler per-clip | error | voice median | error vs voice |
+|---|---|---|---|---|---|
+| `af_heart__friends-now` | 225.53 | 228.80 | −1.43 % | 214.2 | +5.29 % |
+| `af_aoede__you-got-me` | 215.03 | 223.52 | −3.80 % | 221.3 | −2.83 % |
+| `bf_alice__maybe-next-time` | 241.03 | 235.72 | +2.25 % | 248.3 | −2.93 % |
+| `am_onyx__got-time` | 84.22 | 82.27 | +2.37 % | 88.4 | −4.73 % |
+| `am_eric__good-game` | 164.08 | 163.08 | +0.61 % | 161.6 | +1.53 % |
+| `bf_emma__nice-day` | 192.02 | 186.80 | +2.80 % | 181.1 | +6.03 % |
+| `zf_xiaoni__greet` | 224.35 | 227.09 | −1.20 % | 242.1 | −7.33 % |
+| `zm_yunxi__no-worries` | 172.30 | 175.94 | −2.07 % | 175.0 | −1.54 % |
+| `jf_nezumi__be-friends` | 228.67 | 226.24 | +1.07 % | 228.3 | +0.16 % |
+| `jm_kumo__watch-this` | 88.97 | 97.15 | −8.42 % | 86.4 | +2.97 % |
+| `hf_alpha__good-to-see` | 224.42 | 228.32 | −1.71 % | 239.3 | −6.22 % |
+| `ef_dora__see-you` | 178.02 | 171.76 | +3.64 % | 179.3 | −0.71 % |
+
+**Median |error| 2.16 % against the per-clip ruler (2.95 % against the voice
+medians); worst 8.42 % (`jm_kumo`, where the phrase sits 12 % above the voice
+median).** The D22 requirement is ≤ 3 % median error; both readings meet it.
+The remaining worst case changes `w` by ±0.04, i.e. ±0.2 st on `shift-up`, far
+inside the ±5 st / ±1 st acceptance cells.
+
+### 13.7 Exposure and A/B
+
+* `NaturalRenderer::process_into_reported` returns
+  `NaturalRenderReport { loudness, headroom }`, where `HeadroomReport` carries
+  `mode`, `measured_f0_hz`, `weight`, `nominal`, `effective`,
+  `effective_pitch_st()`, `effective_formant_ratio()`,
+  `effective_tilt_db_per_oct()` and `no_headroom()`.
+* `rasp render --json` adds a `headroom` object with the same fields
+  (`mode`, `weight`, `measuredF0Hz`, `effectivePitchSt`,
+  `effectiveFormantRatio`, `effectiveTiltDbPerOct`); the human report prints a
+  `headroom w=… f0=… -> pitch …` line and appends `(no headroom)` when
+  `w = 0`. `batch` writes `weight`, `f0_hz` and the effective pitch/formant into
+  `manifest.tsv` (with `nominal_*` alongside), so `metrics.py` scores what was
+  actually rendered.
+* `--headroom off` on `render`/`batch` reproduces the fixed behaviour for A/B.
+* **CPU:** native, release, 1 s vowel: `shift-up` **37.4 ms/s** with the mapping
+  vs **36.4 ms/s** with `--headroom off` — the measurement costs **≈ 1.0 ms/s
+  (+2.7 %)**, and `natural`/`bright` pay nothing (no pitch direction → no
+  measurement). The dominant cost is still P-03's correction pass.
+
+## 14. Regenerate the HR-2 listening pack
+
+The pack builder calls `rasp render` per trial, so it picks up D22 by default:
+
+```sh
+cargo build -p rasp-cli --release
+# default: the 6 fixed voices x 4 presets, seed 20261028, written to ~/rasp-hr2
+python3 scripts/make_hr2_pack.py --out "$HOME/rasp-hr2-pack"
+```
+
+The generator has no `--headroom` switch (it is outside P-05b's file scope), so
+it uses the product default: **on**. To audition the pre-D22 fixed mapping, use
+`rasp render --headroom off` on the same clip/preset; that is the render the
+nominal D17 matrix and §4 were measured on.
+
+`rasp render --json` now reports `headroom.weight` and the effective point, so
+the pack's `results.tsv` can explain a "nothing happened" trial as *no headroom*
+rather than a bug.
