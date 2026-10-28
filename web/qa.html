@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>RASP listening round — HR-2</title>
+    <!-- Empty data URI: avoids a /favicon.ico request (no network calls on this page). -->
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #101216;
+        --panel: #181b21;
+        --panel-2: #1f232b;
+        --line: #2c323c;
+        --ink: #e7eaf0;
+        --muted: #9aa4b2;
+        --ok: #6ee7a8;
+        --bad: #ff8b8b;
+        --accent: #8ab4ff;
+        --accent-dark: #274a7a;
+      }
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      html { background: var(--bg); }
+      body {
+        margin: 0 auto;
+        max-width: 48rem;
+        padding: 1.5rem 1rem 5rem;
+        background: var(--bg);
+        color: var(--ink);
+        font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      h1 { font-size: 1.45rem; margin: 0 0 0.35rem; }
+      h2 { font-size: 1.1rem; margin: 0 0 0.5rem; }
+      p { margin: 0.45rem 0; }
+      .sub { color: var(--muted); max-width: 38rem; }
+      .muted { color: var(--muted); }
+      .small { font-size: 0.86rem; }
+      code, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      kbd {
+        font-size: 0.8rem;
+        padding: 0.05rem 0.35rem;
+        border: 1px solid #3a4250;
+        border-bottom-width: 2px;
+        border-radius: 4px;
+        background: var(--panel-2);
+        color: var(--ink);
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 1rem 1.1rem;
+        margin: 1rem 0;
+      }
+      .panel.bad { border-color: #6d2b2b; }
+      .panel.bad h2 { color: var(--bad); }
+      button {
+        padding: 0.65rem 1rem;
+        min-height: 2.75rem;
+        background: var(--panel-2);
+        color: var(--ink);
+        border: 1px solid #3a4250;
+        border-radius: 8px;
+        font: inherit;
+        cursor: pointer;
+        touch-action: manipulation;
+      }
+      button:hover:not(:disabled) { border-color: var(--accent); }
+      button:disabled { opacity: 0.45; cursor: default; }
+      button.primary { background: var(--accent-dark); border-color: #3a6aa8; }
+      button.play { min-width: 8.5rem; font-size: 1.02rem; }
+      :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+      .progress-line {
+        display: flex;
+        align-items: center;
+        gap: 0.9rem;
+        flex-wrap: wrap;
+        margin: 0 0 0.5rem;
+      }
+      .progress-line strong { font-size: 0.95rem; }
+      .bar {
+        flex: 1 1 8rem;
+        height: 0.45rem;
+        min-width: 6rem;
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .bar > div { height: 100%; width: 0; background: var(--accent); }
+
+      .buttons { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+      .shortcuts { color: var(--muted); font-size: 0.82rem; margin-top: 0.7rem; }
+      .status { min-height: 1.4rem; margin: 0.5rem 0 0; font-size: 0.88rem; color: var(--muted); }
+      .status.bad { color: var(--bad); }
+
+      form { margin: 0.5rem 0 0; }
+      fieldset.q {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--panel);
+        padding: 0.85rem 1rem 1rem;
+        margin: 0.75rem 0;
+        min-width: 0;
+      }
+      fieldset.q.focus-q { border-color: #4b5a70; }
+      legend {
+        padding: 0 0.35rem;
+        font-weight: 600;
+        font-size: 0.98rem;
+      }
+      legend .num { color: var(--muted); font-weight: 500; margin-right: 0.25rem; }
+      .scale { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+      .scale label {
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+        padding: 0.45rem 0.7rem;
+        min-height: 2.6rem;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-2);
+        cursor: pointer;
+        font-size: 0.92rem;
+      }
+      .scale label:hover { border-color: #4b5a70; }
+      .scale input { accent-color: var(--accent); margin: 0; }
+      .scale label:has(input:checked) {
+        border-color: var(--accent);
+        background: #22324a;
+      }
+      .scale .val { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 1ch; }
+      .notes-row { margin-top: 0.7rem; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; }
+      .notes-row label { color: var(--muted); font-size: 0.88rem; }
+      .notes-row input {
+        flex: 1 1 18rem;
+        min-height: 2.4rem;
+        padding: 0.4rem 0.55rem;
+        background: var(--panel-2);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        font: inherit;
+      }
+
+      .nav {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.9rem;
+        margin-top: 1.1rem;
+      }
+      .nav button { font-size: 1rem; padding-left: 1.6rem; padding-right: 1.6rem; }
+      #next-hint { color: var(--muted); font-size: 0.9rem; }
+
+      table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; font-size: 0.9rem; }
+      caption { text-align: left; color: var(--muted); font-size: 0.86rem; padding-bottom: 0.35rem; }
+      th, td { padding: 0.35rem 0.45rem; border-bottom: 1px solid var(--line); text-align: right; }
+      th:first-child, td:first-child { text-align: left; }
+      thead th { color: var(--muted); font-weight: 500; }
+      tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.02); }
+      .summary-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1rem; }
+      details { margin-top: 1rem; }
+      summary { cursor: pointer; color: var(--muted); }
+      textarea {
+        width: 100%;
+        min-height: 9rem;
+        margin-top: 0.5rem;
+        padding: 0.5rem;
+        background: var(--panel-2);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        font: 0.8rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      footer {
+        margin-top: 2rem;
+        padding-top: 1rem;
+        border-top: 1px solid var(--line);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: center;
+        color: var(--muted);
+        font-size: 0.82rem;
+      }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+      @media (max-width: 30rem) {
+        body { padding-left: 0.7rem; padding-right: 0.7rem; }
+        .scale label { flex: 1 1 100%; }
+        button.play { flex: 1 1 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>RASP listening round — HR-2</h1>
+      <p class="sub">
+        You will hear two versions of the same spoken line, <strong>A</strong> and
+        <strong>B</strong>. Rate what you hear in B against A. 24 trials, about
+        15 minutes. Say what you hear — there are no right answers.
+      </p>
+    </header>
+
+    <div id="boot" class="panel" role="status">Loading the round…</div>
+
+    <div id="fatal" class="panel bad" hidden>
+      <h2>This page needs a pack</h2>
+      <p id="fatal-message"></p>
+      <p class="small muted">
+        Build one with <code>python3 scripts/make_hr2_pack.py</code> and open the
+        <code>index.html</code> it writes.
+      </p>
+    </div>
+
+    <noscript>
+      <div class="panel bad">
+        <h2>JavaScript is off</h2>
+        <p>This listening round needs JavaScript. Enable it and reload the page.</p>
+      </div>
+    </noscript>
+
+    <main id="app" hidden>
+      <section id="trial-view" aria-labelledby="trial-heading">
+        <div class="progress-line">
+          <strong id="trial-heading" tabindex="-1">Trial 1 of 24</strong>
+          <div class="bar" role="progressbar" aria-label="Round progress" aria-valuemin="0" aria-valuemax="24" aria-valuenow="1">
+            <div id="bar-fill"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="buttons">
+            <button type="button" id="play-a" class="play">Play A</button>
+            <button type="button" id="play-b" class="play primary">Play B</button>
+            <button type="button" id="replay">Replay A → B</button>
+          </div>
+          <p class="shortcuts">
+            <kbd>A</kbd> play A &nbsp;·&nbsp; <kbd>B</kbd> play B &nbsp;·&nbsp;
+            <kbd>R</kbd> replay both &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>5</kbd>
+            answer &nbsp;·&nbsp; <kbd>→</kbd> next
+          </p>
+          <p id="audio-status" class="status" role="status" aria-live="polite"></p>
+        </div>
+
+        <form id="questions" novalidate>
+          <fieldset class="q" data-q="q1">
+            <legend><span class="num">1.</span>Same person or different person?</legend>
+            <div class="scale">
+              <label><input type="radio" name="q1" value="1" /><span class="val">1</span><span>Clearly same</span></label>
+              <label><input type="radio" name="q1" value="2" /><span class="val">2</span><span>Probably same</span></label>
+              <label><input type="radio" name="q1" value="3" /><span class="val">3</span><span>Not sure</span></label>
+              <label><input type="radio" name="q1" value="4" /><span class="val">4</span><span>Probably different</span></label>
+              <label><input type="radio" name="q1" value="5" /><span class="val">5</span><span>Clearly different</span></label>
+            </div>
+          </fieldset>
+
+          <fieldset class="q" data-q="q2">
+            <legend><span class="num">2.</span>Body size or just pitch?</legend>
+            <div class="scale">
+              <label><input type="radio" name="q2" value="1" /><span class="val">1</span><span>Just pitch (thin / chipmunk)</span></label>
+              <label><input type="radio" name="q2" value="2" /><span class="val">2</span><span>Mostly pitch</span></label>
+              <label><input type="radio" name="q2" value="3" /><span class="val">3</span><span>Between</span></label>
+              <label><input type="radio" name="q2" value="4" /><span class="val">4</span><span>Mostly body</span></label>
+              <label><input type="radio" name="q2" value="5" /><span class="val">5</span><span>Convincingly bigger / smaller body</span></label>
+            </div>
+          </fieldset>
+
+          <fieldset class="q" data-q="q3">
+            <legend><span class="num">3.</span>Consonants:</legend>
+            <div class="scale">
+              <label><input type="radio" name="q3" value="1" /><span>Crisper</span></label>
+              <label><input type="radio" name="q3" value="2" /><span>Unchanged</span></label>
+              <label><input type="radio" name="q3" value="3" /><span>Clickier</span></label>
+            </div>
+          </fieldset>
+
+          <fieldset class="q" data-q="q4">
+            <legend><span class="num">4.</span>Any warble, phasiness or metallic ring?</legend>
+            <div class="scale">
+              <label><input type="radio" name="q4" value="1" /><span>No</span></label>
+              <label><input type="radio" name="q4" value="2" /><span>Mild</span></label>
+              <label><input type="radio" name="q4" value="3" /><span>Obvious</span></label>
+            </div>
+            <div class="notes-row">
+              <label for="notes">Where? (optional)</label>
+              <input id="notes" name="notes" type="text" maxlength="200" autocomplete="off" placeholder="e.g. on the vowels, end of the line" />
+            </div>
+          </fieldset>
+
+          <fieldset class="q" data-q="q5">
+            <legend><span class="num">5.</span>Would you ship this line in the game?</legend>
+            <div class="scale">
+              <label><input type="radio" name="q5" value="1" /><span>Yes</span></label>
+              <label><input type="radio" name="q5" value="2" /><span>Maybe</span></label>
+              <label><input type="radio" name="q5" value="3" /><span>No</span></label>
+            </div>
+          </fieldset>
+        </form>
+
+        <div class="nav">
+          <button type="button" id="next" class="primary" disabled aria-describedby="next-hint">Next</button>
+          <span id="next-hint">Answer all five to continue</span>
+        </div>
+      </section>
+
+      <section id="summary-view" aria-labelledby="summary-title" hidden>
+        <h2 id="summary-title" tabindex="-1">Round complete</h2>
+        <p class="sub" id="summary-intro"></p>
+
+        <div class="panel">
+          <table id="summary-table">
+            <caption>Mean rating per preset (lower/higher directions are listed under the table).</caption>
+            <thead>
+              <tr>
+                <th scope="col">Preset</th>
+                <th scope="col">n</th>
+                <th scope="col" title="1 = clearly same, 5 = clearly different">Same → diff</th>
+                <th scope="col" title="1 = just pitch, 5 = convincingly body">Pitch → body</th>
+                <th scope="col" title="1 = crisper, 2 = unchanged, 3 = clickier">Consonants</th>
+                <th scope="col" title="1 = none, 2 = mild, 3 = obvious">Artifacts</th>
+                <th scope="col" title="1 = yes, 2 = maybe, 3 = no">Ship</th>
+                <th scope="col">Ship Y / M / N</th>
+              </tr>
+            </thead>
+            <tbody id="summary-body"></tbody>
+          </table>
+          <p class="small muted">
+            Q1: 1 = clearly same person, 5 = clearly different. Q2: 1 = just
+            pitch, 5 = convincingly bigger/smaller body. Q3: 1 = crisper,
+            2 = unchanged, 3 = clickier. Q4: 1 = none, 2 = mild, 3 = obvious.
+            Q5: 1 = yes, 2 = maybe, 3 = no.
+          </p>
+        </div>
+
+        <div class="summary-actions">
+          <button type="button" id="download" class="primary">Download CSV</button>
+          <button type="button" id="restart">Start over</button>
+        </div>
+        <p id="summary-status" class="status" role="status" aria-live="polite"></p>
+
+        <details>
+          <summary>If the download does not appear</summary>
+          <p class="small muted">
+            Select everything below, copy it, and paste it into a file named
+            <code>rasp-hr2.csv</code>.
+          </p>
+          <textarea id="csv-fallback" readonly aria-label="CSV contents"></textarea>
+        </details>
+      </section>
+    </main>
+
+    <footer>
+      <button type="button" id="export">Export CSV</button>
+      <span id="export-status" role="status" aria-live="polite"></span>
+      <span class="muted">Answers save in this browser. Nothing is uploaded.</span>
+      <span class="muted" id="seed-line"></span>
+    </footer>
+
+    <audio id="audio-a" preload="auto" hidden></audio>
+    <audio id="audio-b" preload="auto" hidden></audio>
+
+    <!-- The pack generator replaces this tag with the pack's JSON (no fetch). -->
+    <script id="qa-data" type="application/json">null</script>
+    <script src="qa.js"></script>
+  </body>
+</html>
