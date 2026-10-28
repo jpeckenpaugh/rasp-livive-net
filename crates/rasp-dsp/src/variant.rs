@@ -127,10 +127,7 @@
 
 use std::fmt;
 
-use crate::params::{NaturalParams, MAX_PITCH_ST, MIN_PITCH_ST};
-use crate::transform::{
-    MAX_FORMANT_RATIO, MAX_TILT_DB_PER_OCT, MIN_FORMANT_RATIO, MIN_TILT_DB_PER_OCT,
-};
+use crate::params::NaturalParams;
 
 /// Version of the derivation contract (D24).
 ///
