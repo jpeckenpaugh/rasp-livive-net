@@ -165,8 +165,9 @@
 //!   level, so tilt changes spectral balance rather than loudness. P-08 owns
 //!   the absolute level.
 //!
-//! The range is ±[`MAX_TILT_DB_PER_OCT`] dB/oct. At 48 kHz that is at most
-//! ±22 dB between 60 Hz and 12 kHz, which is a strong but usable timbre trim.
+//! The range is ±[`MAX_TILT_DB_PER_OCT`] dB/oct. At 48 kHz that is −24 dB at
+//! 60 Hz and +22 dB at 12 kHz around the 1 kHz anchor — a strong but usable
+//! timbre trim.
 //! A tilt-only point (`pitch = 1`, `formant = 1`, `tilt ≠ 0`) takes the
 //! correction path rather than the bypass, so it costs one STFT/ISTFT; the
 //! bit-exact bypass requires all three to be neutral.

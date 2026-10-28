@@ -285,12 +285,13 @@ pub fn true_peak_dbtp(signal: &[f32]) -> f32 {
     dbtp(true_peak(signal))
 }
 
-/// `20 log10(value)`, floored so a zero reports a finite number.
+/// `20 log10(value)`, floored so a zero — or a non-finite value — reports a
+/// finite number rather than `-inf`.
 pub fn dbfs(value: f32) -> f32 {
     if value.is_finite() {
         20.0 * value.max(DB_FLOOR).log10()
     } else {
-        f32::NEG_INFINITY
+        20.0 * DB_FLOOR.log10()
     }
 }
 
@@ -466,7 +467,7 @@ impl LoudnessReport {
             level_delta_db: processed_rms_dbfs - source_rms_dbfs,
             pre_limit_true_peak_dbtp: peak_dbtp,
             output_true_peak_dbtp: peak_dbtp,
-            output_sample_peak_dbfs: f32::NEG_INFINITY,
+            output_sample_peak_dbfs: dbfs(0.0),
             limiter_min_gain: 1.0,
             limiter_min_gain_db: 0.0,
             limited: false,

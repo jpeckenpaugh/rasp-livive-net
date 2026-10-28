@@ -31,6 +31,7 @@
 //! synthetic signals with known F0 and the corpus medians.
 
 use super::*;
+use crate::envelope::DEFAULT_LIFTER_SECONDS;
 use crate::pitch::{PitchShiftConfig, PitchShifter};
 use crate::stft::Complex;
 use crate::stft::StftConfig;
@@ -159,6 +160,75 @@ fn zero_sample_rate_is_an_error() {
     assert_eq!(
         VoiceTransformer::new(0, VoiceTransformConfig::d2()).unwrap_err(),
         VoiceTransformError::ZeroSampleRate
+    );
+}
+
+#[test]
+fn adaptive_lifter_leaves_low_f0_alone_and_shortens_at_high_f0() {
+    // A 110 Hz vowel shifted +7 st leaves 165 Hz: 0.75 / 165 Hz = 4.5 ms, so
+    // the configured 4 ms lifter is kept and P-03's measured cells are
+    // untouched.
+    let low = testutil::vowel(
+        110.0,
+        &[700.0, 1220.0, 2600.0],
+        &[80.0, 90.0, 120.0],
+        SR,
+        LEN,
+    );
+    let mut transformer = build(7.0, 1.10);
+    let _ = transformer.process(&low).expect("valid");
+    let f0 = transformer.correction_f0_hz().expect("voiced");
+    assert!((f0 - 165.0).abs() < 3.0, "proxy {f0:.1} Hz");
+    assert!(
+        (transformer.effective_lifter_seconds() - DEFAULT_LIFTER_SECONDS).abs() < 1e-6,
+        "the cap must not bind at {f0:.0} Hz: {} s",
+        transformer.effective_lifter_seconds()
+    );
+
+    // A 220 Hz vowel shifted +7 st leaves 330 Hz: the cap is 2.27 ms, well
+    // below the pitch period, so the pitch pulse cannot enter the envelope.
+    let high = testutil::vowel(
+        220.0,
+        &[700.0, 1220.0, 2600.0],
+        &[80.0, 90.0, 120.0],
+        SR,
+        LEN,
+    );
+    let mut transformer = build(7.0, 1.10);
+    let _ = transformer.process(&high).expect("valid");
+    let f0 = transformer.correction_f0_hz().expect("voiced");
+    let lifter = transformer.effective_lifter_seconds();
+    let expected = LIFTER_PERIOD_FRACTION / f0;
+    assert!(
+        (lifter - expected).abs() < 1e-5,
+        "lifter {lifter:.5} s at {f0:.1} Hz, expected {expected:.5} s"
+    );
+    assert!(
+        lifter < 1.0 / f0,
+        "the lifter must stay below the pitch period (1/F0 = {:.5} s)",
+        1.0 / f0
+    );
+
+    // Shortening the lifter never changes pitch or level: it changes the
+    // envelope's resolution, not the signal's timing or gain.
+    let short_config = VoiceTransformConfig {
+        envelope: EnvelopeConfig {
+            lifter_seconds: 0.002,
+            ..EnvelopeConfig::cepstral()
+        },
+        ..VoiceTransformConfig::d2()
+    };
+    let mut short = VoiceTransformer::new(SR, short_config).expect("valid");
+    short.set_pitch_semitones(7.0);
+    short.set_formant_ratio(1.10);
+    let a = short.process(&high).expect("valid");
+    let b = build(7.0, 1.10).process(&high).expect("valid");
+    assert_eq!(a.len(), b.len());
+    let ratio = testutil::rms(&a) / testutil::rms(&b);
+    assert!(
+        (ratio - 1.0).abs() < 0.05,
+        "lifter change moved RMS by {:.3}×",
+        ratio
     );
 }
 
