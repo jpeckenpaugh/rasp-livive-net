@@ -534,3 +534,215 @@ fn print_regeneration_tables() {
     }
     println!("const TOTAL_COMBINATIONS: u32 = {total};");
 }
+
+// ---------------------------------------------------------------------------
+// V-02 — seed → base voice
+// ---------------------------------------------------------------------------
+
+/// Read the voice ids out of the `"voices": [ … ]` array in `web/registry.json`.
+///
+/// The workspace has no JSON dependency and this module must not add one for a
+/// test, so the small, fixed-shape registry block is scanned directly. The
+/// `"id"` key first appears in `build` (`"id": "3e81…"`), which is why the scan
+/// is restricted to the `voices` array.
+fn registry_voice_ids() -> Vec<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/registry.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+    let start = text
+        .find("\"voices\": [")
+        .unwrap_or_else(|| panic!("{} has no `\"voices\": [` array", path.display()));
+    let end = text[start..]
+        .find(']')
+        .map(|offset| start + offset)
+        .expect("unterminated voices array");
+    let block = &text[start..end];
+
+    let mut ids = Vec::new();
+    let mut rest = block;
+    while let Some(position) = rest.find("\"id\"") {
+        let after = &rest[position + "\"id\"".len()..];
+        let colon = after.find(':').expect("`\"id\"` without a colon");
+        let open = after[colon..].find('"').expect("`\"id\"` without a value") + colon + 1;
+        let close = after[open..].find('"').expect("unterminated voice id") + open;
+        ids.push(after[open..close].to_string());
+        rest = &after[close + 1..];
+    }
+    ids
+}
+
+#[test]
+fn corpus_voice_list_matches_registry() {
+    let registry = registry_voice_ids();
+    assert_eq!(
+        registry.len(),
+        CORPUS_VOICES.len(),
+        "registry has {} voices, CORPUS_VOICES has {}",
+        registry.len(),
+        CORPUS_VOICES.len()
+    );
+    for (index, (listed, registered)) in CORPUS_VOICES.iter().zip(&registry).enumerate() {
+        assert_eq!(
+            listed, registered,
+            "voice {index}: CORPUS_VOICES has {listed:?}, registry has {registered:?}"
+        );
+    }
+
+    // The list is a set, not just the right length: a duplicated id would make
+    // one voice unreachable while this test still passed on counts alone.
+    let unique: std::collections::BTreeSet<_> = CORPUS_VOICES.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        CORPUS_VOICES.len(),
+        "duplicate corpus voice id"
+    );
+    println!(
+        "corpus voices: {} ids, all present in web/registry.json",
+        unique.len()
+    );
+}
+
+#[test]
+fn seed_hash_is_pinned() {
+    // A string-seed hash is a cross-platform contract (D24); pin it so a change
+    // to the tag, schema or FNV loop is a deliberate re-voicing, not a refactor.
+    assert_eq!(seed_u64(""), 0xbfdc_d329_c152_fc37);
+    assert_eq!(seed_u64("npc-0"), 0xf63f_7c23_05ba_de83);
+    assert_eq!(seed_u64("npc-1"), 0xf63f_7b23_05ba_dcd0);
+    assert_eq!(seed_u64("park-42"), 0x3efd_0ab9_9731_50d8);
+    assert_eq!(seed_u64("café ☕"), 0x5d51_d100_d2a1_6ad2);
+}
+
+#[test]
+fn voice_choice_is_deterministic() {
+    for seed in 0..1_000u64 {
+        assert_eq!(choose_voice(seed), choose_voice(seed));
+    }
+    for seed in ["", "npc-0", "npc-1", "park-42", "café ☕"] {
+        let voice = voice_for_seed(seed);
+        assert_eq!(voice, voice_for_seed(seed));
+        assert!(
+            CORPUS_VOICES.contains(&voice),
+            "voice_for_seed({seed:?}) returned {voice:?}, not a corpus id"
+        );
+        let spec = derive_voice(seed);
+        assert_eq!(spec.base_voice, voice);
+        assert_eq!(spec.schema, VARIANT_SCHEMA);
+        assert!(spec.pitch_st.is_finite() && spec.formant_ratio.is_finite());
+        assert!(spec.tilt_db_per_oct.is_finite());
+        // Same string twice: identical bits, including the voice id.
+        assert_eq!(spec, derive_voice(seed));
+    }
+}
+
+#[test]
+fn voice_distribution_over_10k_seeds() {
+    // Acceptance: no voice below 0.5 % or above 4 % over 10,000 seeds. Uniform
+    // is 1.852 %. Both hash forms are measured: raw integers (what
+    // `choose_voice` consumes) and game seed strings (what a caller passes).
+    for (label, seeds) in [
+        (
+            "u64 0..10,000",
+            (0..10_000u64).map(choose_voice).collect::<Vec<_>>(),
+        ),
+        (
+            "strings \"npc-0\"..\"npc-9999\"",
+            (0..10_000)
+                .map(|index| voice_for_seed(&format!("npc-{index}")))
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let mut counts = BTreeMap::new();
+        for voice in &seeds {
+            *counts.entry(*voice).or_insert(0usize) += 1;
+        }
+        assert_eq!(
+            counts.len(),
+            CORPUS_VOICES.len(),
+            "{label}: not every voice drew"
+        );
+        let total = seeds.len() as f64;
+        let mut worst_low = (f64::MAX, "");
+        let mut worst_high = (f64::MIN, "");
+        for voice in CORPUS_VOICES {
+            let share = 100.0 * counts.get(voice).copied().unwrap_or(0) as f64 / total;
+            if share < worst_low.0 {
+                worst_low = (share, voice);
+            }
+            if share > worst_high.0 {
+                worst_high = (share, voice);
+            }
+            assert!(
+                (0.5..=4.0).contains(&share),
+                "{label}: {voice} share {share:.2} % outside 0.5–4 %"
+            );
+        }
+        println!(
+            "{label}: min {:.2} % ({}), max {:.2} % ({})",
+            worst_low.0, worst_low.1, worst_high.0, worst_high.1
+        );
+    }
+}
+
+#[test]
+fn golden_derive_voice_vectors() {
+    // The product contract is one string in, voice + quantised params out (D23,
+    // D24). Pin it end to end, including the string hash, so a change anywhere
+    // in the chain is a deliberate schema bump rather than a silent re-cast.
+    // These are the same three seeds `crates/rasp-wasm/verify.mjs` prints.
+    const GOLDEN: [(&str, &str, &str, i32, i32, i32); 3] = [
+        ("npc-0", "af_kore", "masc-mid", -45, 181, -1),
+        ("npc-1", "hm_omega", "neutral-bright", 34, 238, 6),
+        ("park-42", "jf_gongitsune", "fem-low", 16, 208, -3),
+    ];
+    for &(seed, voice, archetype, pitch, formant, tilt) in &GOLDEN {
+        let spec = derive_voice(seed);
+        assert_eq!(spec.base_voice, voice, "seed {seed:?} voice");
+        assert_eq!(spec.archetype.id(), archetype, "seed {seed:?} archetype");
+        assert_eq!(
+            (spec.pitch_steps(), spec.formant_steps(), spec.tilt_steps()),
+            (pitch, formant, tilt),
+            "seed {seed:?} parameters"
+        );
+    }
+}
+
+#[test]
+fn golden_voice_choices() {
+    // The mapping is the save-file contract: a seed that changes voice silently
+    // would re-cast an NPC. Pinned for 20 stable strings plus edge cases.
+    const GOLDEN_SEED_STRINGS: [&str; 20] = [
+        "npc-0", "npc-1", "npc-2", "npc-3", "npc-4", "npc-5", "npc-6", "npc-7", "npc-8", "npc-9",
+        "npc-10", "npc-11", "npc-12", "npc-13", "npc-14", "npc-15", "npc-16", "npc-17", "npc-18",
+        "npc-19",
+    ];
+    const GOLDEN_VOICES: [&str; 20] = [
+        "af_kore",
+        "hm_omega",
+        "af_kore",
+        "hf_beta",
+        "zf_xiaoyi",
+        "jf_nezumi",
+        "am_santa",
+        "hm_omega",
+        "hm_psi",
+        "am_puck",
+        "bf_isabella",
+        "zf_xiaobei",
+        "hf_beta",
+        "bf_lily",
+        "if_sara",
+        "hm_omega",
+        "af_alloy",
+        "pm_santa",
+        "em_santa",
+        "am_michael",
+    ];
+    for (index, seed) in GOLDEN_SEED_STRINGS.iter().enumerate() {
+        assert_eq!(
+            voice_for_seed(seed),
+            GOLDEN_VOICES[index],
+            "golden voice {index} for seed {seed:?}"
+        );
+    }
+}

@@ -33,6 +33,9 @@
 //!   (PLAN V-01, D23/D24): integer SplitMix64 draws, quantised steps, a
 //!   versioned schema and twelve archetypes clamped to D1's validated region.
 //!   Headroom is deliberately **not** applied here (D22 owns it per clip).
+//!   The same module owns V-02's `seed string → 54-voice` resolution
+//!   ([`variant::derive_voice`]), so the game's one seed produces both the
+//!   voice and its parameters.
 //!
 //! # Pitch shifting (P-02)
 //!

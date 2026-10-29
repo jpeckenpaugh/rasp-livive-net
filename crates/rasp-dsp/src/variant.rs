@@ -621,7 +621,8 @@ pub fn derive_voice(seed: &str) -> VariantSpec<'static> {
 }
 
 /// FNV-1a 64 of `(HASH_TAG, schema, seed, voice)`.
-fn seed_hash(schema: u16, seed: u64, base_voice: &str) -> u64 {    let mut hash = FNV_OFFSET_BASIS;
+fn seed_hash(schema: u16, seed: u64, base_voice: &str) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
     hash = fnv1a64(hash, HASH_TAG);
     hash = fnv1a64(hash, &schema.to_le_bytes());
     hash = fnv1a64(hash, &seed.to_le_bytes());

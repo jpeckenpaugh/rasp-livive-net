@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rasp-opus = { path = "../rasp-opus" }
+rasp-dsp = { path = "../rasp-dsp" }
 # Must match the installed `wasm-bindgen` CLI exactly (docs/setup.md §2).
 wasm-bindgen = "=0.2.129"
 # `js_sys::Error` is the only JS API used: the typed error surface. 0.3.106 is

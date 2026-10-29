@@ -161,6 +161,7 @@ name = "rasp-wasm"
 version = "0.1.0"
 dependencies = [
  "js-sys",
+ "rasp-dsp",
  "rasp-opus",
  "wasm-bindgen",
 ]
