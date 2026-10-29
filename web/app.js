@@ -37,6 +37,26 @@ const bootParams = new URLSearchParams(location.search);
 const ENGINE_MODULE = bootParams.get("wasm") || "./wasm/rasp.js";
 const ENGINE_WASM = bootParams.get("wasmbin") || "./wasm/rasp_bg.wasm";
 
+// Cache-busting for the wasm bundle. GitHub Pages serves assets with
+// max-age=600, so a returning browser can pair a fresh app.js with an older
+// rasp.js. The deploy writes version.json (commit SHA); append it to the
+// engine and registry URLs so a deploy is atomic from the page's point of view.
+let assetVersion = "";
+function withVersion(url) {
+  if (!assetVersion) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(assetVersion)}`;
+}
+async function readAssetVersion() {
+  try {
+    const response = await fetch("./version.json", { cache: "no-store" });
+    if (!response.ok) return;
+    const data = await response.json();
+    assetVersion = String(data.version || "").slice(0, 12);
+  } catch {
+    /* local dev without version.json — no cache busting needed */
+  }
+}
+
 const $ = (id) => document.getElementById(id);
 
 const els = {
@@ -374,7 +394,7 @@ function onSelectionChanged() {
 }
 
 function loadRegistry(boot) {
-  return fetch("./registry.json", { cache: "no-cache" })
+  return fetch(withVersion("./registry.json"), { cache: "no-cache" })
     .then((response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status} for registry.json`);
       return response.json();
@@ -1087,12 +1107,13 @@ function engineReady(module) {
 async function loadEngine() {
   setStatus("Loading the wasm engine…", "", `import ${ENGINE_MODULE}`);
   try {
-    const module = await import(new URL(ENGINE_MODULE, location.href).href);
+    await readAssetVersion();
+    const module = await import(withVersion(new URL(ENGINE_MODULE, location.href).href));
     if (typeof module.default !== "function") {
       throw new Error("wasm glue has no default init export");
     }
     // Object form: wasm-bindgen warns on a bare URL argument.
-    await module.default({ module_or_path: new URL(ENGINE_WASM, location.href).href });
+    await module.default({ module_or_path: withVersion(new URL(ENGINE_WASM, location.href).href) });
     for (const name of [
       "describe",
       "render",

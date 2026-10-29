@@ -225,6 +225,16 @@ jobs:
           fi
           cp CNAME web/CNAME
 
+      # Cache-busting token for the wasm bundle. Pages serves assets with
+      # max-age=600, so without this a returning browser can pair a fresh
+      # app.js with a stale rasp.js (which is exactly how the demo first
+      # deployed green but showed "Engine unavailable" in a warm browser).
+      - name: Stamp asset version
+        run: |
+          set -euo pipefail
+          printf '{"version":"%s"}\n' "${GITHUB_SHA:0:12}" > web/version.json
+          cat web/version.json
+
       # Cheap structural checks on the page root. The demo app (U-01) already
       # has an index; failing here beats publishing a directory listing.
       - name: Sanity-check the artifact root
@@ -233,6 +243,7 @@ jobs:
           test -f web/index.html || { echo "::error::web/index.html is missing"; exit 1; }
           test -f web/registry.json || { echo "::error::web/registry.json is missing"; exit 1; }
           test -f web/CNAME || { echo "::error::web/CNAME was not staged"; exit 1; }
+          test -f web/version.json || { echo "::error::web/version.json was not stamped"; exit 1; }
           echo "artifact root:"
           ls -1 web
 

@@ -36,3 +36,4 @@ web/CNAME
 
 # macOS
 .DS_Store
+web/version.json
