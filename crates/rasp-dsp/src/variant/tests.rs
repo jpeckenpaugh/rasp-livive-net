@@ -265,26 +265,34 @@ fn headroom_is_not_applied_here() {
 
 #[test]
 fn step_constants_span_the_documented_ranges() {
-    assert_eq!(
+    // The step grid reproduces the parameter bounds to within one `f32` ulp.
+    // Exact equality is not available at 1.33: `266 × 0.005f32` rounds to
+    // 1.32999992, one ulp below the `MAX_FORMANT_RATIO` literal.
+    let close = |a: f32, b: f32| (a - b).abs() <= 1e-6;
+    assert!(close(
         steps_to_f32(MIN_PITCH_STEPS, PITCH_STEP),
-        MIN_PITCH_ST,
-        "pitch floor step count"
-    );
-    assert_eq!(
+        MIN_PITCH_ST
+    ));
+    assert!(close(
         steps_to_f32(MAX_PITCH_STEPS, PITCH_STEP),
-        MAX_PITCH_ST,
-        "pitch ceiling step count"
-    );
-    assert_eq!(
+        MAX_PITCH_ST
+    ));
+    assert!(close(
         steps_to_f32(MIN_FORMANT_STEPS, FORMANT_STEP),
         MIN_FORMANT_RATIO
-    );
-    assert_eq!(
+    ));
+    assert!(close(
         steps_to_f32(MAX_FORMANT_STEPS, FORMANT_STEP),
         MAX_FORMANT_RATIO
-    );
-    assert_eq!(steps_to_f32(MIN_TILT_STEPS, TILT_STEP), MIN_TILT_DB_PER_OCT);
-    assert_eq!(steps_to_f32(MAX_TILT_STEPS, TILT_STEP), MAX_TILT_DB_PER_OCT);
+    ));
+    assert!(close(
+        steps_to_f32(MIN_TILT_STEPS, TILT_STEP),
+        MIN_TILT_DB_PER_OCT
+    ));
+    assert!(close(
+        steps_to_f32(MAX_TILT_STEPS, TILT_STEP),
+        MAX_TILT_DB_PER_OCT
+    ));
 }
 
 #[test]
