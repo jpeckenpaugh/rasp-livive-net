@@ -28,5 +28,11 @@ __pycache__/
 # The smoke page and the app require a build step before serving.
 web/wasm/
 
+# The Pages deploy workflow copies the root `CNAME` into `web/` so it lands in
+# the uploaded artifact (S-01). It is generated, never committed: a second copy
+# of the domain would be a second source of truth. Ignored so a local dry-run of
+# the deploy steps cannot be staged by accident.
+web/CNAME
+
 # macOS
 .DS_Store

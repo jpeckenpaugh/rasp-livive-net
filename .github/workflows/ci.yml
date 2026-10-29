@@ -5,15 +5,13 @@
 #
 #   unformatted code / clippy regressions  -> lint-test
 #   corpus drift or corruption             -> corpus-integrity (offline)
-#   wasm build breakage                    -> wasm-build
+#   wasm build breakage / size regression  -> wasm-build (builds the shipped
+#                                             artifact and enforces W-02's gate)
 #   fixture pipeline rot                   -> fixtures-smoke (arms itself, see below)
 #
 # Deliberately NOT in this workflow:
-#   - Deployment. GitHub Pages publishing is S-01 and owns its own workflow and
-#     permissions. This one is read-only and must stay that way.
-#   - wasm-bindgen / wasm-opt / the real wasm size gate. W-01 introduces the
-#     first `wasm-bindgen` dependency and W-02 the budget; see the TODO in the
-#     wasm-build job.
+#   - Deployment. GitHub Pages publishing is S-01 and owns its own workflow
+#     (deploy.yml) and permissions. This one is read-only and must stay that way.
 #   - Upstream corpus comparison. A rebake upstream must never turn every pull
 #     request red; it runs on a schedule instead, in corpus-upstream.yml.
 #
@@ -24,9 +22,12 @@
 #   cargo build --workspace --target wasm32-unknown-unknown --release
 #   python3 scripts/vendor_corpus.py --check
 #
-# Action pinning: actions use floating major tags for readability. Before the
-# first public release (S-01) tighten every `uses:` below to a full commit SHA,
-# because a tag can be moved and a workflow runs with the repo token.
+# Action pinning: deploy.yml -- the only workflow with `pages: write` and
+# `id-token: write` -- pins every `uses:` to a full commit SHA. The actions in
+# this file stay on floating major tags for readability: this workflow is
+# read-only (`contents: read`, no secrets, no deployment credentials), so a
+# moved tag here can corrupt a check result but cannot publish or push. If this
+# workflow ever gains write permissions, pin it to SHAs in the same change.
 
 name: CI
 
@@ -50,13 +51,19 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep in sync with deploy.yml and crates/rasp-wasm/Cargo.toml.
+  WASM_BINDGEN_CLI: "0.2.129"
+  BINARYEN_VERSION: "133"
+  # PLAN section 8 / W-02 / X-08: total wasm bundle <= 1.5 MB gzipped.
+  # Decimal MB on purpose (1,500,000 B), the stricter reading of "1.5 MB".
+  WASM_GZIP_LIMIT_BYTES: "1500000"
 
 jobs:
   lint-test:
     name: lint + test (native)
     runs-on: ubuntu-latest
     steps:
-      # NOTE: tighten to a commit SHA at S-01 (see header).
+      # NOTE: read-only workflow; floating major tag by policy (see header).
       - uses: actions/checkout@v4
 
       # rust-toolchain.toml is the single source of truth for the compiler,
@@ -99,7 +106,7 @@ jobs:
     name: wasm release build
     runs-on: ubuntu-latest
     steps:
-      # NOTE: tighten to a commit SHA at S-01 (see header).
+      # NOTE: read-only workflow; floating major tag by policy (see header).
       - uses: actions/checkout@v4
 
       - name: Install toolchain pinned by rust-toolchain.toml
@@ -122,38 +129,102 @@ jobs:
       - name: cargo build --workspace --target wasm32-unknown-unknown --release
         run: cargo build --workspace --target wasm32-unknown-unknown --release
 
-      # TODO(W-02): when W-01/W-02 land, this job must also
-      #   1. install `wasm-bindgen-cli` 0.2.129 (the exact version pinned in
-      #      docs/setup.md; it must match the crate version or generation
-      #      fails) - cache the install, e.g. with `taiki-e/install-action` or
-      #      an actions/cache step, never an uncached `cargo install` per run;
-      #   2. install `wasm-opt` (binaryen) at a pinned version;
-      #   3. run `wasm-bindgen --target web` and `wasm-opt -Oz` on the output;
-      #   4. enforce the real size gate: total gzipped bundle <= 1.5 MB
-      #      (PLAN section 8 / R9 / X-08) and record the number in docs/perf.md.
-      # Until W-01, no crate depends on wasm-bindgen, so installing the CLI
-      # here would only add minutes and a version-mismatch failure mode.
-      - name: Report wasm artifact sizes (no gate yet - see TODO(W-02))
+      # TODO(W-02) is closed here: this job now builds the artifact that ships
+      # (scripts/build_wasm.sh) instead of a bare cargo output, and enforces the
+      # <= 1.5 MB gzipped budget. The same gate runs in deploy.yml; both must
+      # stay identical, because deploy.yml is the one that can publish.
+      #
+      # The two CLIs are pinned and cached rather than `cargo install`-ed every
+      # run: wasm-bindgen-cli must equal the crate pin exactly, and an unpinned
+      # binaryen would make the size gate non-reproducible.
+      - name: Cache wasm-bindgen CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.WASM_BINDGEN_CLI }}
+
+      - name: Install wasm-bindgen CLI (exact pin)
         run: |
           set -euo pipefail
-          found=0
-          for f in target/wasm32-unknown-unknown/release/*.wasm; do
-            [ -e "$f" ] || continue
-            found=1
-            raw=$(wc -c < "$f")
-            gz=$(gzip -9 -c "$f" | wc -c)
-            printf '%-58s %9d B raw   %9d B gzip\n' "$f" "$raw" "$gz"
-          done
-          if [ "$found" -eq 0 ]; then
-            echo "no .wasm artifact under target/wasm32-unknown-unknown/release"
-            echo "(expected while the workspace has no wasm-facing crate; see TODO(W-02))"
+          want="$WASM_BINDGEN_CLI"
+          have="$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)"
+          if [ "$have" = "$want" ]; then
+            echo "wasm-bindgen $have restored from cache"
+            exit 0
           fi
+          cargo install wasm-bindgen-cli --version "$want" --locked
+          have="$(wasm-bindgen --version | awk '{print $2}')"
+          if [ "$have" != "$want" ]; then
+            echo "::error::wasm-bindgen CLI $have does not match the crate pin $want"
+            exit 1
+          fi
+          echo "installed wasm-bindgen $have"
+
+      - name: Cache binaryen (wasm-opt)
+        uses: actions/cache@v4
+        with:
+          path: ~/.binaryen
+          key: binaryen-${{ runner.os }}-${{ runner.arch }}-${{ env.BINARYEN_VERSION }}
+
+      - name: Install binaryen (pinned)
+        run: |
+          set -euo pipefail
+          dir="$HOME/.binaryen/$BINARYEN_VERSION"
+          if [ ! -x "$dir/bin/wasm-opt" ]; then
+            url="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+            mkdir -p "$HOME/.binaryen"
+            curl -fsSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/binaryen.tar.gz" "$url"
+            tar -xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$HOME/.binaryen"
+            rm -rf "$dir"
+            mv "$HOME/.binaryen/binaryen-version_${BINARYEN_VERSION}" "$dir"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          got="$("$dir/bin/wasm-opt" --version)"
+          case "$got" in
+            *"version $BINARYEN_VERSION"*) echo "$got" ;;
+            *)
+              echo "::error::binaryen reports '$got', expected version $BINARYEN_VERSION"
+              exit 1
+              ;;
+          esac
+
+      - name: Build the shipped wasm module (scripts/build_wasm.sh)
+        run: bash scripts/build_wasm.sh
+
+      # Fails the job, not just a warning: an oversized bundle must never reach
+      # a deploy run unnoticed. Prints the number so a regression is visible in
+      # the log without opening the artifact.
+      - name: wasm size gate (<= 1.5 MB gzipped)
+        run: |
+          set -euo pipefail
+          wasm=web/wasm/rasp_bg.wasm
+          if [ ! -f "$wasm" ]; then
+            echo "::error file=$wasm::scripts/build_wasm.sh did not produce $wasm"
+            exit 1
+          fi
+          magic="$(od -An -tx1 -N4 "$wasm" | tr -d ' \n')"
+          if [ "$magic" != "0061736d" ]; then
+            echo "::error file=$wasm::not a wasm module (magic 0x${magic}, expected 0x0061736d)"
+            exit 1
+          fi
+          raw="$(wc -c < "$wasm" | tr -d ' ')"
+          gz="$(gzip -9 -c "$wasm" | wc -c | tr -d ' ')"
+          limit="$WASM_GZIP_LIMIT_BYTES"
+          awk -v raw="$raw" -v gz="$gz" -v limit="$limit" 'BEGIN {
+            printf "wasm size: %d B raw / %d B gzip (%.1f / %.1f KiB)\n", raw, gz, raw / 1024, gz / 1024;
+            printf "size gate: %d B gzip = %.2f MB, limit %.2f MB (%.1f%% of budget)\n", gz, gz / 1000000, limit / 1000000, gz * 100 / limit;
+          }'
+          if [ "$gz" -gt "$limit" ]; then
+            echo "::error file=$wasm::wasm is ${gz} B gzipped, over the ${limit} B gzip budget (PLAN section 8 / W-02)"
+            exit 1
+          fi
+          echo "size gate: PASS"
 
   corpus-integrity:
     name: corpus integrity (offline)
     runs-on: ubuntu-latest
     steps:
-      # NOTE: tighten to a commit SHA at S-01 (see header).
+      # NOTE: read-only workflow; floating major tag by policy (see header).
       - uses: actions/checkout@v4
 
       # Verifies every registry path, file presence, byte count and SHA-256
@@ -173,7 +244,7 @@ jobs:
     name: fixtures smoke (F-05)
     runs-on: ubuntu-latest
     steps:
-      # NOTE: tighten to a commit SHA at S-01 (see header).
+      # NOTE: read-only workflow; floating major tag by policy (see header).
       - uses: actions/checkout@v4
 
       # F-05 may not have landed yet. Hard-coding this job to run

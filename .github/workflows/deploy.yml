@@ -1,0 +1,312 @@
+# GitHub Pages deploy for https://rasp.livive.net (S-01).
+#
+# One job builds, one job publishes. Publishing is deliberately gated behind a
+# full rebuild from source rather than a committed binary: DECISIONS D18 says
+# `web/wasm/` is build output, so "the shipped wasm matches the Rust" is true by
+# construction and the size gate (W-02 / PLAN section 8) measures the bytes that
+# are actually served.
+#
+# What this workflow guarantees:
+#   - the wasm is rebuilt from this commit, present, and <= 1.5 MB gzipped;
+#   - the vendored corpus still matches web/registry.json (offline, no network);
+#   - `web/` is uploaded as the Pages artifact with `CNAME` at its root;
+#   - the deployed wasm is really served as `application/wasm` (post-deploy curl,
+#     because Pages sets Content-Type from the file extension, not from us).
+#
+# It fails closed: a missing wasm, a wrong magic number, a corpus mismatch, an
+# oversized bundle or a bad Content-Type all turn the run red instead of quietly
+# publishing a site that cannot use WebAssembly.instantiateStreaming.
+#
+# No secrets. Permissions are the minimum the official Pages actions need:
+# `contents: read` to check out, `pages: write` + `id-token: write` for OIDC.
+# Nothing here writes to the repository, so no commit/push token is needed.
+#
+# Action pinning: every `uses:` is pinned to a full commit SHA with the release
+# in a trailing comment, because this workflow runs with `pages: write` and
+# `id-token: write` -- a moved tag would be a direct path to publishing. Bump a
+# SHA only by bumping the comment with it, and re-run the workflow afterwards.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  # Manual runs are the rollback mechanism: dispatch this workflow on a tag or
+  # a branch whose content is known good (docs/release.md, "Rollback").
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time. A second push cancels the in-flight one: Pages serves a
+# single deployment, and a cancelled run cannot publish a partial site (and never
+# reaches `deploy-pages` at all if it is cancelled during the build). Never let
+# two artifact uploads race.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must match crates/rasp-wasm/Cargo.toml and docs/setup.md section 2 exactly.
+  WASM_BINDGEN_CLI: "0.2.129"
+  # The binaryen release the local reference build uses (PLAN wave 1 log).
+  BINARYEN_VERSION: "133"
+  # PLAN section 8 / W-02 / X-08: total wasm bundle <= 1.5 MB gzipped.
+  # Decimal MB on purpose (1,500,000 B, not 1.5 MiB): the budget is a load-time
+  # claim, and decimal is the stricter of the two readings.
+  WASM_GZIP_LIMIT_BYTES: "1500000"
+  EXPECTED_CNAME: rasp.livive.net
+
+jobs:
+  build:
+    name: build site
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml is the single source of truth for the compiler,
+      # rustfmt/clippy and the wasm32 target. `rustup show` resolves the
+      # override from the checked-out file; installing the resolved toolchain
+      # explicitly is what makes the pin real on a runner that ships `stable`.
+      - name: Install toolchain pinned by rust-toolchain.toml
+        run: |
+          toolchain="$(rustup show active-toolchain | cut -d' ' -f1)"
+          echo "pinned toolchain: $toolchain"
+          rustup toolchain install "$toolchain" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy \
+            --target wasm32-unknown-unknown
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Same policy as ci.yml: rust-cache already hashes Cargo.lock,
+          # Cargo.toml, rust-toolchain.toml and rustc into its key; the explicit
+          # hash makes the invalidation rule reviewable.
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      # Fail fast, before spending minutes on tool installs. A test failure must
+      # never be able to publish: the deploy job only runs if this job is green.
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # Offline, stdlib-only, ~0.1 s. A corrupted or drifted corpus (D6/R8) is
+      # caught here rather than by a 404 in the browser.
+      - name: python3 scripts/vendor_corpus.py --check
+        run: python3 scripts/vendor_corpus.py --check
+
+      # wasm-bindgen-cli is a cargo build of its own (~minutes cold). Cache the
+      # resolved binary by exact version; a version bump changes the key, so a
+      # stale binary can never be reused for a different crate pin.
+      - name: Cache wasm-bindgen CLI
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.WASM_BINDGEN_CLI }}
+
+      - name: Install wasm-bindgen CLI (exact pin)
+        run: |
+          set -euo pipefail
+          want="$WASM_BINDGEN_CLI"
+          have="$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)"
+          if [ "$have" = "$want" ]; then
+            echo "wasm-bindgen $have restored from cache"
+            exit 0
+          fi
+          if [ -n "$have" ]; then
+            echo "cached wasm-bindgen $have does not match the pin; reinstalling"
+          fi
+          cargo install wasm-bindgen-cli --version "$want" --locked
+          have="$(wasm-bindgen --version | awk '{print $2}')"
+          if [ "$have" != "$want" ]; then
+            echo "::error::wasm-bindgen CLI $have does not match the crate pin $want"
+            exit 1
+          fi
+          echo "installed wasm-bindgen $have"
+
+      # binaryen/wasm-opt shrinks the bundle before the size gate. Pinned and
+      # cached: an unpinned `latest` would make the gate's result non-reproducible.
+      - name: Cache binaryen (wasm-opt)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.binaryen
+          key: binaryen-${{ runner.os }}-${{ runner.arch }}-${{ env.BINARYEN_VERSION }}
+
+      - name: Install binaryen (pinned)
+        run: |
+          set -euo pipefail
+          dir="$HOME/.binaryen/$BINARYEN_VERSION"
+          if [ ! -x "$dir/bin/wasm-opt" ]; then
+            url="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+            mkdir -p "$HOME/.binaryen"
+            echo "downloading $url"
+            curl -fsSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/binaryen.tar.gz" "$url"
+            tar -xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$HOME/.binaryen"
+            rm -rf "$dir"
+            mv "$HOME/.binaryen/binaryen-version_${BINARYEN_VERSION}" "$dir"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          got="$("$dir/bin/wasm-opt" --version)"
+          case "$got" in
+            *"version $BINARYEN_VERSION"*) echo "$got" ;;
+            *)
+              echo "::error::binaryen reports '$got', expected version $BINARYEN_VERSION"
+              exit 1
+              ;;
+          esac
+
+      # The one build path: pinned toolchain -> wasm-bindgen CLI -> wasm-opt -Oz,
+      # writing web/wasm/. build_wasm.sh refuses a mismatched CLI and refuses to
+      # ship unoptimised output if -Oz fails.
+      - name: bash scripts/build_wasm.sh
+        run: bash scripts/build_wasm.sh
+
+      # Fails closed on: missing file, not a wasm module, oversized bundle.
+      # A wrong magic number is the cheap way to catch a truncated/failed
+      # generation before Pages ever sees it.
+      - name: Verify wasm exists, is a module, and fits the size budget
+        run: |
+          set -euo pipefail
+          wasm=web/wasm/rasp_bg.wasm
+          if [ ! -f "$wasm" ]; then
+            echo "::error file=$wasm::scripts/build_wasm.sh did not produce $wasm"
+            exit 1
+          fi
+
+          magic="$(od -An -tx1 -N4 "$wasm" | tr -d ' \n')"
+          if [ "$magic" != "0061736d" ]; then
+            echo "::error file=$wasm::not a wasm module (magic 0x${magic}, expected 0x0061736d)"
+            exit 1
+          fi
+
+          raw="$(wc -c < "$wasm" | tr -d ' ')"
+          gz="$(gzip -9 -c "$wasm" | wc -c | tr -d ' ')"
+          limit="$WASM_GZIP_LIMIT_BYTES"
+          awk -v raw="$raw" -v gz="$gz" -v limit="$limit" 'BEGIN {
+            printf "wasm size: %d B raw / %d B gzip (%.1f / %.1f KiB)\n", raw, gz, raw / 1024, gz / 1024;
+            printf "size gate: %d B gzip = %.2f MB, limit %.2f MB (%.1f%% of budget)\n", gz, gz / 1000000, limit / 1000000, gz * 100 / limit;
+          }'
+          if [ "$gz" -gt "$limit" ]; then
+            echo "::error file=$wasm::wasm is ${gz} B gzipped, over the ${limit} B gzip budget (PLAN section 8 / W-02)"
+            exit 1
+          fi
+          echo "size gate: PASS"
+          # Pages serves .wasm as application/wasm based on the extension; the
+          # deploy job proves the response header on the live URL. Nothing to
+          # configure here, and this file must stay named rasp_bg.wasm.
+
+      # CNAME lives at the repo root (single source of truth, already tracked).
+      # GitHub Pages publishes the artifact root, so it has to be inside web/ in
+      # the artifact. Copied here instead of committed as web/CNAME to avoid two
+      # files that can disagree about the domain; see docs/release.md.
+      #
+      # NOTE: with an Actions publishing source GitHub does not apply a CNAME
+      # file to the repository's custom-domain setting -- the domain is set once
+      # in Settings -> Pages. The file in the artifact keeps the intent in the
+      # deployable bytes (and is what a branch-based source would need).
+      - name: Publish CNAME into the artifact root
+        run: |
+          set -euo pipefail
+          if [ ! -f CNAME ]; then
+            echo "::error::CNAME is missing at the repo root"
+            exit 1
+          fi
+          got="$(tr -d '[:space:]' < CNAME)"
+          if [ "$got" != "$EXPECTED_CNAME" ]; then
+            echo "::error file=CNAME::CNAME says '$got', expected '$EXPECTED_CNAME'"
+            exit 1
+          fi
+          cp CNAME web/CNAME
+
+      # Cheap structural checks on the page root. The demo app (U-01) already
+      # has an index; failing here beats publishing a directory listing.
+      - name: Sanity-check the artifact root
+        run: |
+          set -euo pipefail
+          test -f web/index.html || { echo "::error::web/index.html is missing"; exit 1; }
+          test -f web/registry.json || { echo "::error::web/registry.json is missing"; exit 1; }
+          test -f web/CNAME || { echo "::error::web/CNAME was not staged"; exit 1; }
+          echo "artifact root:"
+          ls -1 web
+
+      # Reads the Pages configuration (custom domain, base path) and fails if
+      # Pages is not enabled. `enablement` stays false: GITHUB_TOKEN cannot
+      # enable Pages, and silently trying to would hide a settings problem.
+      - name: actions/configure-pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      # `path: web` uploads web/ as the site root; the artifact is what is
+      # served, so anything not under web/ is not published. retention-days is
+      # longer than the 1-day default so a recent previous artifact remains
+      # downloadable during a rollback investigation (docs/release.md).
+      - name: actions/upload-pages-artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: web
+          retention-days: 7
+
+  deploy:
+    name: deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The `github-pages` environment is what makes the deployment record exist:
+    # it is the rollback index (Settings -> Environments -> github-pages).
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: actions/deploy-pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      # PLAN S-01 acceptance: MIME checked in CI. The build job can only prove
+      # the file is a wasm module; only the live server can prove the header,
+      # because Pages derives Content-Type from the extension and ignores what
+      # we would like to send (K1: no custom headers on Pages).
+      - name: Verify the live wasm is served as application/wasm
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          base="${PAGE_URL%/}"
+          wasm_url="$base/wasm/rasp_bg.wasm"
+          echo "deployed commit: $GITHUB_SHA"
+          echo "checking: $wasm_url"
+
+          mime=""
+          for attempt in 1 2 3 4 5 6; do
+            headers="$(curl -fsSLI --retry 2 --retry-delay 2 "$wasm_url" || true)"
+            mime="$(printf '%s\n' "$headers" \
+              | grep -i '^content-type:' | tail -n1 | cut -d: -f2- \
+              | tr -d ' \r' || true)"
+            if [ -n "$mime" ]; then
+              break
+            fi
+            echo "attempt $attempt: no response from the CDN yet; waiting 10 s"
+            sleep 10
+          done
+
+          echo "content-type: ${mime:-<none>}"
+          case "$mime" in
+            application/wasm*) ;;
+            *)
+              echo "::error::$wasm_url is served as '${mime:-<none>}', expected application/wasm"
+              exit 1
+              ;;
+          esac
+
+          code="$(curl -s -o /dev/null -w '%{http_code}' "$base/")"
+          echo "site root: HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::$base/ returned HTTP $code"
+            exit 1
+          fi
+          echo "post-deploy checks: PASS"

@@ -39,7 +39,7 @@ jobs:
     name: compare vendored corpus with upstream
     runs-on: ubuntu-latest
     steps:
-      # NOTE: tighten to a commit SHA at S-01, like the pins in ci.yml.
+      # NOTE: read-only workflow; floating major tag by policy (see ci.yml header).
       - uses: actions/checkout@v4
 
       - name: python3 scripts/vendor_corpus.py --compare-upstream
