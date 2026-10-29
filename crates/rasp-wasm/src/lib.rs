@@ -32,6 +32,10 @@
 //!   derive → render happens in one call. Output is mono `f32` at 48 kHz (the
 //!   corpus rate) and is exactly as long as the decoded clip, so it is
 //!   sample-aligned with the source and safe for an A/B crossfade.
+//! * **Manual knobs.** [`render_params`] runs the same chain from explicit
+//!   pitch / formant / tilt values (clamped by [`NaturalParams`], never
+//!   rejected), and [`effective_params`] reports the D22 point that chain
+//!   actually uses for a clip, so a UI can show the headroom-honest values.
 //! * **Determinism (D24).** The same seed string returns the same voice and
 //!   parameters on every platform and every session. `describe(seed)` and
 //!   `render(_, seed)` agree by construction: both call
@@ -78,7 +82,9 @@ use std::fmt;
 
 use js_sys::{Error as JsError, Object, Reflect};
 use rasp_dsp::variant::derive_voice;
-use rasp_dsp::{NaturalRenderer, VARIANT_SCHEMA};
+use rasp_dsp::{
+    median_f0_hz, HeadroomMode, HeadroomReport, NaturalParams, NaturalRenderer, VARIANT_SCHEMA,
+};
 use rasp_opus::{DecodeError, DecodedClip};
 use wasm_bindgen::prelude::*;
 
@@ -161,18 +167,114 @@ pub fn describe(seed: &str) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub fn render(weba: &[u8], seed: &str) -> Result<Vec<f32>, JsValue> {
     let clip = rasp_opus::decode_weba(weba).map_err(|err| failure("DecodeError", &err))?;
-    let input = mono_samples(&clip);
-    let spec = derive_voice(seed);
+    render_decoded(&clip, derive_voice(seed).to_params())
+}
 
+/// Decode a `.weba` clip and render it at explicit natural-mode knobs.
+///
+/// This is the manual-knob counterpart of [`render`]: same decoder, same
+/// [`rasp_dsp::NaturalRenderer`] chain (D22 headroom scaling, then the P-08 RMS
+/// match and true-peak limiter), same 48 kHz mono output and the same
+/// sample-aligned length contract. Out-of-range or non-finite knobs are
+/// **sanitised** by [`NaturalParams`] rather than rejected: pitch is clamped to
+/// −12…+12 st, formant to 0.75…1.33 and tilt to −6…+6 dB/oct; a non-finite
+/// value becomes that axis's neutral value. This is what the demo's sliders
+/// rely on, so a typed `RenderError` here means the DSP genuinely failed, not
+/// that a caller typed `13`.
+///
+/// The caller owns the returned array; see the crate docs.
+#[wasm_bindgen]
+pub fn render_params(
+    weba: &[u8],
+    pitch_st: f32,
+    formant_ratio: f32,
+    tilt_db_per_oct: f32,
+) -> Result<Vec<f32>, JsValue> {
+    let clip = rasp_opus::decode_weba(weba).map_err(|err| failure("DecodeError", &err))?;
+    render_decoded(
+        &clip,
+        NaturalParams::new(pitch_st, formant_ratio, tilt_db_per_oct),
+    )
+}
+
+/// The operating point a [`render_params`] call would actually use for this
+/// clip, after the D22 headroom mapping.
+///
+/// Returns `{ pitchSt, formantRatio, tiltDbPerOct, headroomWeight }`, where
+/// `headroomWeight` is the D22 weight `w ∈ [0, 1]` and the three knobs are the
+/// **effective** values (`nominal × w`, with the formant ratio scaled in
+/// octaves). The nominal knobs stay the caller's: this call does not change
+/// them.
+///
+/// The measurement and the mapping are the ones the renderer itself uses:
+/// [`median_f0_hz`] on the decoded clip (the same `F0Tracker` as
+/// `NaturalRenderer::process_into_reported`) followed by
+/// [`HeadroomReport::new`] in [`HeadroomMode::On`]. As in the renderer, a
+/// nominal pitch of exactly zero has no direction to exhaust, so the result is
+/// a pass-through with `w = 1`; a clip with no voiced frames also falls back to
+/// `w = 1` rather than guessing. Reading this does **not** render the clip, so
+/// a UI can update its "effective" line while a slider moves.
+#[wasm_bindgen]
+pub fn effective_params(
+    weba: &[u8],
+    pitch_st: f32,
+    formant_ratio: f32,
+    tilt_db_per_oct: f32,
+) -> Result<JsValue, JsValue> {
+    let clip = rasp_opus::decode_weba(weba).map_err(|err| failure("DecodeError", &err))?;
+    let input = mono_samples(&clip);
+    let nominal = NaturalParams::new(pitch_st, formant_ratio, tilt_db_per_oct);
+    let report = effective_report(&input, clip.sample_rate, nominal);
+
+    let object = Object::new();
+    set(
+        &object,
+        "pitchSt",
+        &JsValue::from_f64(f64::from(report.effective_pitch_st())),
+    );
+    set(
+        &object,
+        "formantRatio",
+        &JsValue::from_f64(f64::from(report.effective_formant_ratio())),
+    );
+    set(
+        &object,
+        "tiltDbPerOct",
+        &JsValue::from_f64(f64::from(report.effective_tilt_db_per_oct())),
+    );
+    set(
+        &object,
+        "headroomWeight",
+        &JsValue::from_f64(f64::from(report.weight)),
+    );
+    Ok(object.into())
+}
+
+/// Decode once, then run the complete natural chain at one validated point.
+fn render_decoded(clip: &DecodedClip, params: NaturalParams) -> Result<Vec<f32>, JsValue> {
+    let input = mono_samples(clip);
     let mut renderer =
         NaturalRenderer::d2(clip.sample_rate).map_err(|err| failure("RenderError", &err))?;
-    renderer.set_params(spec.to_params());
+    renderer.set_params(params);
 
     let mut output = Vec::with_capacity(input.len());
     renderer
         .process_into(&input, &mut output)
         .map_err(|err| failure("RenderError", &err))?;
     Ok(output)
+}
+
+/// The D22 report for a clip and a nominal point, without rendering it.
+///
+/// This mirrors `NaturalRenderer::resolve_headroom` exactly: mode `On`, no
+/// measurement when the nominal pitch is zero, and the same median-F0
+/// estimator otherwise. Keeping it here (rather than rendering twice) lets the
+/// page show what happened while a slider moves.
+fn effective_report(input: &[f32], sample_rate: u32, nominal: NaturalParams) -> HeadroomReport {
+    if nominal.pitch_st == 0.0 {
+        return HeadroomReport::pass_through(HeadroomMode::On, nominal);
+    }
+    HeadroomReport::new(HeadroomMode::On, nominal, median_f0_hz(input, sample_rate))
 }
 
 /// A decoded clip: interleaved `f32` samples at 48 kHz.
@@ -297,9 +399,70 @@ mod tests {
         assert!(rendered.iter().any(|sample| *sample != 0.0));
     }
 
+    #[test]
+    fn render_params_clamps_instead_of_erroring() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/audio/af_heart/hello.weba");
+        let Ok(bytes) = std::fs::read(&path) else {
+            println!("SKIP: {} is not present", path.display());
+            return;
+        };
+        let clip = rasp_opus::decode_weba(&bytes).expect("corpus clip decodes");
+
+        // Far outside every axis: sanitised to the documented limits, not a
+        // typed error, and the same audio as an explicit in-range call.
+        let clamped = render_params(&bytes, 40.0, 4.0, -40.0).expect("out-of-range clamps");
+        let at_limit = render_params(&bytes, 12.0, 1.33, -6.0).expect("limit renders");
+        assert_eq!(clamped.len(), clip.frame_count());
+        assert_eq!(clamped, at_limit);
+        assert!(clamped.iter().all(|sample| sample.is_finite()));
+
+        // Non-finite knobs become the neutral value on that axis.
+        let neutral = render_params(&bytes, 0.0, 1.0, 0.0).expect("neutral renders");
+        let nan = render_params(&bytes, f32::NAN, f32::NAN, f32::NAN).expect("NaN is neutral");
+        assert_eq!(nan, neutral);
+    }
+
+    #[test]
+    fn effective_report_uses_the_d22_direction() {
+        let sample_rate = 48_000;
+        let sine = |hz: f32| -> Vec<f32> {
+            (0..sample_rate as usize)
+                .map(|index| {
+                    (2.0 * std::f32::consts::PI * hz * index as f32 / sample_rate as f32).sin()
+                        * 0.3
+                })
+                .collect()
+        };
+
+        // A deep voice asked to go deeper has little room: w < 1 and the
+        // effective shift is smaller in magnitude.
+        let low = NaturalParams::new(-4.0, 0.85, 0.0);
+        let report = effective_report(&sine(90.0), sample_rate, low);
+        assert!(
+            report.weight < 1.0,
+            "weight {} should be < 1",
+            report.weight
+        );
+        assert!(report.effective_pitch_st() > low.pitch_st);
+        assert!(report.effective_formant_ratio() > low.formant_ratio);
+
+        // A low voice asked to go up has plenty of room (w = 1), while a high
+        // voice under the same preset is clamped: D22 is directional.
+        let up = NaturalParams::new(7.0, 1.10, 0.75);
+        assert_eq!(effective_report(&sine(90.0), sample_rate, up).weight, 1.0);
+        assert!(effective_report(&sine(300.0), sample_rate, up).weight < 1.0);
+
+        // Pitch zero has no direction: a pass-through even on a high voice.
+        let bright = NaturalParams::new(0.0, 1.0, 1.5);
+        let report = effective_report(&sine(300.0), sample_rate, bright);
+        assert_eq!(report.weight, 1.0);
+        assert_eq!(report.effective, bright);
+    }
+
     // The error path and `describe` are exercised through the real wasm module
     // by `crates/rasp-wasm/verify.mjs`. On the host, constructing a `JsValue`
     // panics by design ("function not implemented on non-wasm32 targets"), so a
-    // native test cannot observe the typed error value; only the pure success
-    // path is unit-tested here.
+    // native test cannot observe the typed error value or the `effective_params`
+    // object; only the pure success path is unit-tested here.
 }

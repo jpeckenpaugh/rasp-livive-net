@@ -3,25 +3,243 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RASP — placeholder</title>
-    <style>
-      body {
-        margin: 2rem auto;
-        max-width: 40rem;
-        padding: 0 1rem;
-        font-family: system-ui, sans-serif;
-        line-height: 1.5;
-      }
-    </style>
+    <title>RASP — seeded voices from 54 Kokoro voices</title>
+    <meta
+      name="description"
+      content="RASP turns one seed into one voice: a base voice from a 54-voice Kokoro corpus plus a stable pitch, formant and tilt variant, rendered in the browser with wasm."
+    />
+    <!-- Empty data URI: avoids a /favicon.ico 404 console error on a clean load. -->
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./app.css" />
   </head>
   <body>
-    <h1>RASP</h1>
-    <p>
-      This is a placeholder page. The demo app is built in Stage U of the
-      project plan.
-    </p>
-    <p>
-      Read the plan: <a href="../PLAN.md">PLAN.md</a>.
-    </p>
+    <header class="masthead">
+      <div class="masthead-inner">
+        <p class="eyebrow">rasp.livive.net / demo</p>
+        <h1>RASP</h1>
+        <p class="tagline">Seeded voices from <strong>54 Kokoro voices</strong>.</p>
+        <p class="lede">
+          A seed picks one corpus voice and a stable pitch / formant / tilt variant.
+          The same seed gives the same voice — and the same NPC — forever. A/B any
+          line against the original, move the knobs, then generate a cast.
+        </p>
+        <dl class="engine" aria-label="Engine status">
+          <div>
+            <dt>Engine</dt>
+            <dd id="engine-state" data-kind="">Booting…</dd>
+          </div>
+          <div>
+            <dt>Schema</dt>
+            <dd id="engine-schema">—</dd>
+          </div>
+          <div>
+            <dt>Wasm</dt>
+            <dd id="engine-size">—</dd>
+          </div>
+          <div>
+            <dt>Registry</dt>
+            <dd id="engine-registry">Loading…</dd>
+          </div>
+        </dl>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel panel-wide" id="voice-panel" aria-labelledby="voice-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="voice-title">Voice &amp; line</h2>
+            <p>
+              All 54 corpus voices and 26 game lines. Filter by language or gender,
+              then pick the line to A/B.
+            </p>
+          </div>
+          <span class="pill" id="voice-count">Loading…</span>
+        </div>
+
+        <div class="filters">
+          <fieldset class="filter-group">
+            <legend>Language</legend>
+            <div class="chips" id="language-chips"></div>
+          </fieldset>
+          <fieldset class="filter-group">
+            <legend>Gender</legend>
+            <div class="chips" id="gender-chips"></div>
+          </fieldset>
+        </div>
+
+        <div class="pick-row">
+          <label class="field" for="voice-select">
+            <span>Voice</span>
+            <select id="voice-select" aria-label="Voice"></select>
+          </label>
+          <label class="field" for="phrase-select">
+            <span>Line</span>
+            <select id="phrase-select" aria-label="Line"></select>
+          </label>
+          <div class="field field-button">
+            <span aria-hidden="true">&nbsp;</span>
+            <button id="play-original" class="ghost" type="button">
+              Play original <kbd>O</kbd>
+            </button>
+          </div>
+        </div>
+        <p class="hint" id="voice-hint">—</p>
+      </section>
+
+      <section class="panel" id="knob-panel" aria-labelledby="knob-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="knob-title">Knobs</h2>
+            <p>
+              Pitch, formant and tilt are independent axes. Headroom (D22) scales
+              the push a voice actually has in the requested direction.
+            </p>
+          </div>
+          <button id="reset-knobs" class="ghost small" type="button">Reset</button>
+        </div>
+
+        <div class="knob">
+          <div class="knob-head">
+            <label for="pitch">Pitch</label>
+            <output id="pitch-out" for="pitch">+0.00 st · 0 c</output>
+          </div>
+          <input id="pitch" type="range" min="-12" max="12" step="0.05" value="0" />
+          <div class="knob-scale"><span>−12 st</span><span>0</span><span>+12 st</span></div>
+        </div>
+
+        <div class="knob">
+          <div class="knob-head">
+            <label for="formant">Formant</label>
+            <output id="formant-out" for="formant">×1.000 · 0.0%</output>
+          </div>
+          <input id="formant" type="range" min="0.75" max="1.33" step="0.005" value="1" />
+          <div class="knob-scale"><span>×0.75</span><span>×1.00</span><span>×1.33</span></div>
+        </div>
+
+        <div class="knob">
+          <div class="knob-head">
+            <label for="tilt">Tilt</label>
+            <output id="tilt-out" for="tilt">+0.00 dB/oct</output>
+          </div>
+          <input id="tilt" type="range" min="-6" max="6" step="0.25" value="0" />
+          <div class="knob-scale"><span>−6</span><span>0</span><span>+6 dB/oct</span></div>
+        </div>
+
+        <div class="presets" role="group" aria-label="Presets">
+          <button class="chip preset" type="button" data-preset="natural" aria-pressed="true">natural</button>
+          <button class="chip preset" type="button" data-preset="shift-up" aria-pressed="false">shift-up</button>
+          <button class="chip preset" type="button" data-preset="shift-down" aria-pressed="false">shift-down</button>
+          <button class="chip preset" type="button" data-preset="bright" aria-pressed="false">bright</button>
+          <button class="chip preset" type="button" data-preset="deep" aria-pressed="false">deep</button>
+        </div>
+
+        <p class="effective" id="effective" data-state="pending">
+          effective: waiting for the engine and a line…
+        </p>
+      </section>
+
+      <section class="panel" id="seed-panel" aria-labelledby="seed-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="seed-title">Seed</h2>
+            <p>
+              One string resolves to one base voice, one archetype and one quantised
+              parameter set. Nothing is drawn at play time.
+            </p>
+          </div>
+          <span class="pill" id="seed-schema">schema —</span>
+        </div>
+
+        <div class="seed-row">
+          <label class="field" for="seed-input">
+            <span>Seed</span>
+            <input
+              id="seed-input"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              autocapitalize="off"
+              placeholder="npc-123"
+            />
+          </label>
+          <div class="seed-actions">
+            <button id="derive" class="primary" type="button">Derive</button>
+            <button id="new-seed" class="ghost" type="button">New seed <kbd>N</kbd></button>
+          </div>
+        </div>
+        <p class="hint">Same seed, same voice — forever.</p>
+
+        <dl class="readout" id="seed-readout">
+          <div>
+            <dt>Seed voice</dt>
+            <dd id="seed-voice" class="accent">—</dd>
+          </div>
+          <div>
+            <dt>Archetype</dt>
+            <dd id="seed-archetype">—</dd>
+          </div>
+          <div>
+            <dt>Requested</dt>
+            <dd id="seed-params">—</dd>
+          </div>
+          <div>
+            <dt>Schema</dt>
+            <dd id="seed-schema-value">—</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="panel panel-wide" id="play-panel" aria-labelledby="play-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="play-title">Play</h2>
+            <p>
+              Both buttons play the same line: the original corpus clip, and the
+              current knobs through the wasm chain. Lengths are sample-aligned.
+            </p>
+          </div>
+          <span class="pill" id="play-mode">ready</span>
+        </div>
+        <div class="transport">
+          <button id="play-transformed" class="primary" type="button">
+            Play transformed <kbd>Space</kbd>
+          </button>
+          <button id="play-original-2" class="ghost" type="button">
+            Play original <kbd>O</kbd>
+          </button>
+          <span class="transport-note" id="transport-note">—</span>
+        </div>
+      </section>
+
+      <section class="panel panel-wide" id="npc-panel" aria-labelledby="npc-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="npc-title">NPC cast</h2>
+            <p>
+              Twelve seeded voices on the selected line. Each card is reproducible
+              from its seed — copy one into the field above to bring it back.
+            </p>
+          </div>
+          <button id="generate-npcs" class="ghost" type="button">Generate 12 NPCs</button>
+        </div>
+        <div class="npc-grid" id="npc-grid">
+          <p class="empty">No cast yet — generate 12 NPCs.</p>
+        </div>
+      </section>
+
+      <section class="panel panel-wide status-panel" id="status-panel" aria-labelledby="status-title">
+        <div class="panel-head">
+          <h2 id="status-title">Status</h2>
+        </div>
+        <p class="status" id="status" role="status" aria-live="polite">
+          Loading the registry…
+        </p>
+        <p class="status-detail" id="status-detail">—</p>
+      </section>
+    </main>
+
+    <audio id="original-audio" preload="none"></audio>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>

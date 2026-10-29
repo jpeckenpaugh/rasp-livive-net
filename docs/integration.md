@@ -22,11 +22,30 @@ Assets live at `https://rasp.livive.net/` (GitHub Pages, `access-control-allow-o
 Cross-origin is fine on Pages today. If that ever changes, vendor `rasp-client.js`
 plus `wasm/` into the pp repo; `baseUrl` is configurable for exactly that.
 
+## Engine exports (live now)
+
+The wasm is deployed at `https://rasp.livive.net/wasm/rasp.js` (CORS `*`). You can
+call it directly, without the wrapper below:
+
+```js
+import init, { variant_schema, describe, render, render_params, effective_params }
+  from 'https://rasp.livive.net/wasm/rasp.js';
+await init();                       // loads ./wasm/rasp_bg.wasm next to rasp.js
+
+describe(seed)                      // {seed, voiceId, archetype, schema, pitchSt, formantRatio, tiltDbPerOct}
+render(webaBytes, seed)             // Float32Array, 48 kHz mono, seeded params
+render_params(webaBytes, p, f, t)   // Float32Array, explicit pitch/formant/tilt
+effective_params(webaBytes, p, f, t)// what headroom actually applied (D22)
+variant_schema()                     // 1
+```
+
+`rasp-client.js` (the caching/playback wrapper) is not published yet; until it is,
+use these exports plus the caching notes below.
+
 ## API
 
 ```js
 import { createRaspVoice } from 'https://rasp.livive.net/rasp-client.js';
-
 const voice = await createRaspVoice({ baseUrl: 'https://rasp.livive.net/' });
 // voice.supported === false  → no wasm; speak() resolves false instead of throwing
 

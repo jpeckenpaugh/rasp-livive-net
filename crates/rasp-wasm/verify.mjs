@@ -210,6 +210,8 @@ console.log(
 if (typeof wasm.variant_schema !== "function") fail("variant_schema is missing");
 if (typeof wasm.describe !== "function") fail("describe is missing");
 if (typeof wasm.render !== "function") fail("render is missing");
+if (typeof wasm.render_params !== "function") fail("render_params is missing");
+if (typeof wasm.effective_params !== "function") fail("effective_params is missing");
 if (typeof wasm.decode !== "function") fail("decode (legacy D-04 export) is missing");
 
 const schema = wasm.variant_schema();
@@ -280,6 +282,14 @@ for (const [label, action] of [
   [
     "render(junk)",
     () => wasm.render(new Uint8Array([0x00, 0x01, 0x02, 0x03]), "npc-0"),
+  ],
+  [
+    "render_params(junk)",
+    () => wasm.render_params(new Uint8Array([0x00, 0x01, 0x02, 0x03]), 0, 1, 0),
+  ],
+  [
+    "effective_params(junk)",
+    () => wasm.effective_params(new Uint8Array([0x00, 0x01, 0x02, 0x03]), 0, 1, 0),
   ],
 ]) {
   try {
@@ -386,6 +396,109 @@ for (const job of jobs) {
     renderMs,
     peak,
   });
+}
+
+// --- Manual knobs: render_params / effective_params (U-03) ------------------
+console.log("\n==> render_params / effective_params");
+{
+  const voice = "af_heart";
+  const entry = registry.files?.[voice]?.hello;
+  if (!entry) {
+    fail(`${voice}: registry has no hello clip for the render_params check`);
+  } else {
+    const bytes = fs.readFileSync(path.join(ROOT, "web", entry.path));
+    const decoded = wasm.decode(bytes);
+    const frames = decoded.length();
+    decoded.free();
+
+    const shifted = wasm.render_params(bytes, 7, 1.1, 0.75);
+    const clamped = wasm.render_params(bytes, 40, 4, -40);
+    const atLimit = wasm.render_params(bytes, 12, 1.33, -6);
+    if (shifted.length !== frames) {
+      fail(`render_params(+7): ${shifted.length} samples vs decoded ${frames}`);
+    }
+    if (clamped.length !== frames) {
+      fail(`render_params(clamped): ${clamped.length} samples vs decoded ${frames}`);
+    }
+    if (!sameBytes(clamped, atLimit)) {
+      fail("render_params clamped out-of-range knobs differently from the explicit limit");
+    }
+    let peak = 0;
+    for (const sample of shifted) {
+      if (!Number.isFinite(sample)) {
+        fail("render_params(+7): non-finite sample");
+        break;
+      }
+      peak = Math.max(peak, Math.abs(sample));
+    }
+    if (peak > 1.01) fail(`render_params(+7): peak ${peak.toFixed(4)} > 1.01`);
+    console.log(
+      `    render_params(+7/1.10/+0.75): ${shifted.length} samples ` +
+        `= decoded ${frames}, peak ${peak.toFixed(3)}; ` +
+        `40/4/−40 == 12/1.33/−6 byte-for-byte`,
+    );
+
+    // The low/high pair is the D22 direction check. `am_onyx` (≈88 Hz) moving
+    // down has little room (w < 1); `bf_alice` (≈248 Hz) moving up likewise.
+    // A low voice moving *up* has full room by construction (w = 1).
+    const cases = [
+      { voice: "af_heart", pitch: 0, formant: 1.0, tilt: 1.5, expect: "pass" },
+      { voice: "bf_alice", pitch: 7, formant: 1.1, tilt: 0.75, expect: "below" },
+      { voice: "am_onyx", pitch: -4, formant: 0.85, tilt: 0, expect: "below" },
+      { voice: "am_onyx", pitch: 7, formant: 1.1, tilt: 0.75, expect: "full" },
+    ];
+    console.log(
+      "    voice      nominal            headroom w  effective",
+    );
+    for (const item of cases) {
+      const clipEntry = registry.files?.[item.voice]?.hello;
+      if (!clipEntry) {
+        fail(`${item.voice}: registry has no hello clip for effective_params`);
+        continue;
+      }
+      const clipBytes = fs.readFileSync(path.join(ROOT, "web", clipEntry.path));
+      const effective = wasm.effective_params(
+        clipBytes,
+        item.pitch,
+        item.formant,
+        item.tilt,
+      );
+      for (const field of ["pitchSt", "formantRatio", "tiltDbPerOct", "headroomWeight"]) {
+        if (typeof effective[field] !== "number" || !Number.isFinite(effective[field])) {
+          fail(`effective_params(${item.voice}, ${item.pitch}): ${field} is not finite`);
+        }
+      }
+      const w = effective.headroomWeight;
+      if (w < 0 || w > 1) fail(`effective_params(${item.voice}): weight ${w} outside [0, 1]`);
+      const near = (a, b) => Math.abs(a - b) <= 1e-4;
+      if (!near(effective.pitchSt, item.pitch * w)) {
+        fail(`effective_params(${item.voice}): pitch ${effective.pitchSt} != ${item.pitch} × ${w}`);
+      }
+      if (!near(effective.tiltDbPerOct, item.tilt * w)) {
+        fail(
+          `effective_params(${item.voice}): tilt ${effective.tiltDbPerOct} != ${item.tilt} × ${w}`,
+        );
+      }
+      if (!near(effective.formantRatio, item.formant ** w)) {
+        fail(
+          `effective_params(${item.voice}): formant ${effective.formantRatio} != ${item.formant}^${w}`,
+        );
+      }
+      if (item.expect === "pass" && w !== 1) {
+        fail(`effective_params(${item.voice}, pitch 0): weight ${w}, expected 1`);
+      }
+      if (item.expect === "below" && !(w < 1)) {
+        fail(`effective_params(${item.voice}, ${item.pitch}): weight ${w}, expected < 1`);
+      }
+      console.log(
+        `    ${item.voice.padEnd(10)} ` +
+          `${`${item.pitch > 0 ? "+" : ""}${item.pitch} st / ${item.formant} / ${item.tilt}`.padEnd(20)} ` +
+          `${w.toFixed(3).padStart(10)}  ` +
+          `${effective.pitchSt >= 0 ? "+" : ""}${effective.pitchSt.toFixed(2)} st / ` +
+          `${effective.formantRatio.toFixed(4)} / ${effective.tiltDbPerOct.toFixed(2)}`,
+      );
+    }
+  }
 }
 
 // --- Report -----------------------------------------------------------------
