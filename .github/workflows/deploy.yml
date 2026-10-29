@@ -282,42 +282,54 @@ jobs:
       # the file is a wasm module; only the live server can prove the header,
       # because Pages derives Content-Type from the extension and ignores what
       # we would like to send (K1: no custom headers on Pages).
-      - name: Verify the live wasm is served as application/wasm
+      - name: Verify the live artifact and wasm MIME
         env:
           PAGE_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
           set -euo pipefail
           base="${PAGE_URL%/}"
-          wasm_url="$base/wasm/rasp_bg.wasm"
+          short="${GITHUB_SHA:0:12}"
           echo "deployed commit: $GITHUB_SHA"
-          echo "checking: $wasm_url"
+          echo "base: $base"
 
-          mime=""
-          for attempt in 1 2 3 4 5 6; do
-            headers="$(curl -fsSLI --retry 2 --retry-delay 2 "$wasm_url" || true)"
-            mime="$(printf '%s\n' "$headers" \
-              | grep -i '^content-type:' | tail -n1 | cut -d: -f2- \
-              | tr -d ' \r' || true)"
-            if [ -n "$mime" ]; then
+          # 1. Wait for the new artifact to be the one being served. version.json
+          #    is cache-busted per attempt, so this is a real signal rather than
+          #    "some edge answered". Deploys are atomic but CDN propagation is not.
+          live=""
+          for attempt in $(seq 1 18); do
+            live="$(curl -fsS "$base/version.json?cb=$RANDOM$attempt" 2>/dev/null               | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' || true)"
+            if [ "$live" = "$short" ]; then
+              echo "version.json = $live (attempt $attempt)"
               break
             fi
-            echo "attempt $attempt: no response from the CDN yet; waiting 10 s"
+            echo "attempt $attempt: live version '${live:-<none>}', want '$short'; waiting 10 s"
             sleep 10
           done
-
-          echo "content-type: ${mime:-<none>}"
-          case "$mime" in
-            application/wasm*) ;;
-            *)
-              echo "::error::$wasm_url is served as '${mime:-<none>}', expected application/wasm"
-              exit 1
-              ;;
-          esac
-
-          code="$(curl -s -o /dev/null -w '%{http_code}' "$base/")"
-          echo "site root: HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "::error::$base/ returned HTTP $code"
+          if [ "$live" != "$short" ]; then
+            echo "::error::live version.json is '${live:-<none>}', expected '$short' (deploy did not propagate)"
             exit 1
           fi
-          echo "post-deploy checks: PASS"
+
+          # 2. Only now is the wasm check meaningful. Require 200 + application/wasm.
+          wasm_url="$base/wasm/rasp_bg.wasm?v=$short"
+          mime=""
+          code=""
+          ok=0
+          for attempt in $(seq 1 9); do
+            read -r code mime <<<"$(curl -sSL -o /dev/null \
+              -w '%{http_code} %{content_type}' "$wasm_url" || echo '000 none')"
+            ok=0
+            if [ "$code" = "200" ]; then
+              case "$mime" in
+                application/wasm*) ok=1 ;;
+              esac
+            fi
+            if [ "$ok" = "1" ]; then
+              echo "wasm: HTTP $code, content-type $mime"
+              exit 0
+            fi
+            echo "attempt $attempt: HTTP $code, content-type '${mime:-<none>}'; waiting 10 s"
+            sleep 10
+          done
+          echo "::error::$wasm_url returned HTTP $code as '${mime:-<none>}', expected 200 application/wasm"
+          exit 1
