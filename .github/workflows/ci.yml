@@ -266,9 +266,23 @@ jobs:
             echo "::warning title=fixtures-smoke is a no-op::scripts/make_fixtures.py does not exist yet (F-05 not landed). This job arms itself automatically when the script appears."
           fi
 
-      - name: ffmpeg version
+      # The runner image ships an ffmpeg build that does not always include the
+      # libopus *decoder*, which is the only valid oracle for the reference
+      # fixtures (D-02). Install the distro build explicitly and assert the
+      # decoder instead of discovering this inside make_fixtures.py.
+      - name: Ensure ffmpeg with the libopus decoder
         if: steps.fixtures.outputs.present == 'true'
-        run: ffmpeg -version | head -1
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -hide_banner -version | head -1
+          ffmpeg -hide_banner -decoders | grep -qE '^ *[A-Z.]+ +libopus' || {
+            echo "::error::ffmpeg has no libopus decoder; reference fixtures cannot be generated"
+            ffmpeg -hide_banner -decoders | grep -i opus || true
+            exit 1
+          }
+          ffmpeg -hide_banner -decoders | grep -i opus | head -3
 
       # Proves the fixture path works from a clean checkout using only the
       # vendored corpus in web/audio/ (no committed audio in fixtures/).
