@@ -509,3 +509,27 @@ nominal D17 matrix and §4 were measured on.
 `rasp render --json` now reports `headroom.weight` and the effective point, so
 the pack's `results.tsv` can explain a "nothing happened" trial as *no headroom*
 rather than a bug.
+
+## Known limitation — two cells exceed the D17 p90 gate (P-03c)
+
+`shift-up` on `am_onyx__got-time` (p90 28.58 c) and `deep` on `am_eric__good-game`
+(p90 27.04 c) exceed the 25 c p90 limit with medians of −0.12 / −0.77 c and zero
+octave outliers.
+
+This is a **measurement limitation, not a pitch error**:
+
+| test | `am_onyx` | `am_eric` | shows |
+|---|---|---|---|
+| per-harmonic instantaneous frequency, render vs pitch-only | ≤ 2.2 c at F0 | ≤ 1.1 c at F0 | harmonic frequencies unchanged |
+| same correction gain on a stationary synthetic vowel | p90 0.43 c | p90 0.15 c | gain modulation is pitch-transparent |
+| zero-gain control (ISTFT only) | = pitch-only | = pitch-only | the second STFT adds nothing |
+| frames carrying the p90 | 1–2 of 28 | 1–2 of 28 | verdict on a handful of frames |
+
+The failing frames have render-side HNR of 1–4 dB, where a 40 ms YIN reading is
+not reliable. The correction pass changes harmonic balance, and YIN follows the
+balance, not the frequency.
+
+No tolerance was widened and no DSP was changed (renders are bit-identical). If
+pitch wobble is audible on these two clips, this diagnosis is wrong and the cell
+escalates. Backlog: **P-07f** — an IF-based pitch ruler that survives timbre
+change.

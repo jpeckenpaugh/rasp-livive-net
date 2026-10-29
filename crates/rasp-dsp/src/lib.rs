@@ -116,7 +116,7 @@ pub use transform::{
     MIN_TILT_DB_PER_OCT, TILT_REFERENCE_HZ, WIDE_CORRECTION_F0_HZ, WIDE_CORRECTION_WINDOW,
 };
 pub use variant::{
-    derive, derive_with_schema, Archetype, ArchetypeNominal, VariantError, VariantSpec,
-    FORMANT_JITTER_STEPS, FORMANT_STEP, PITCH_JITTER_STEPS, PITCH_STEP, TILT_JITTER_STEPS,
-    TILT_STEP, VARIANT_SCHEMA,
+    choose_voice, derive, derive_voice, derive_with_schema, seed_u64, voice_for_seed, Archetype,
+    ArchetypeNominal, VariantError, VariantSpec, CORPUS_VOICES, FORMANT_JITTER_STEPS, FORMANT_STEP,
+    PITCH_JITTER_STEPS, PITCH_STEP, TILT_JITTER_STEPS, TILT_STEP, VARIANT_SCHEMA,
 };

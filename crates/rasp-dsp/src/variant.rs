@@ -118,12 +118,24 @@
 //! here would double-scale and would make the stored NPC record disagree with
 //! what was rendered.
 //!
-//! # Base-voice resolution is not here (V-02)
+//! # Base-voice resolution (V-02)
 //!
-//! Any string is accepted as a voice id — empty, unknown, non-corpus. V-02 owns
-//! `(seed) → base_voice` over the 54 corpus voices and its distribution
-//! weighting; this module only answers "given this voice and seed, which
-//! parameters?".
+//! The second half of the product contract lives here too, so the two draws
+//! share one hash implementation:
+//!
+//! * [`CORPUS_VOICES`] — the 54 corpus ids, in registry order, stated once.
+//! * [`choose_voice`] — `u64 → &'static str`, the integer draw.
+//! * [`voice_for_seed`] — `seed string → &'static str`.
+//! * [`derive_voice`] — `seed string → VariantSpec`, i.e. voice **and** params
+//!   from the one string the game stores.
+//!
+//! [`derive`] itself still accepts any voice string, so a caller that already
+//! resolved the voice (or wants a non-corpus id in a test) is not forced through
+//! V-02. The weighting is deliberately light: the voice draw is uniform over
+//! the 54 ids, which is the flattest possible distribution and therefore cannot
+//! collapse onto a handful of voices. D25 explicitly does not require
+//! uniformity; the 10,000-seed measurement in `variant/tests.rs` reports the
+//! share of every id and enforces the 0.5 %–4 % no-collapse bounds.
 
 use std::fmt;
 
@@ -164,6 +176,76 @@ const DOMAIN_ARCHETYPE: u64 = 0x0A7E_0000_0000_0001;
 const DOMAIN_PITCH: u64 = 0x0A7E_0000_0000_0002;
 const DOMAIN_FORMANT: u64 = 0x0A7E_0000_0000_0003;
 const DOMAIN_TILT: u64 = 0x0A7E_0000_0000_0004;
+/// Domain tag for V-02's base-voice draw.
+const DOMAIN_VOICE: u64 = 0x0A7E_0000_0000_0005;
+
+/// Domain tag for hashing the game's seed **string** into a `u64` (V-02).
+///
+/// Distinct from [`HASH_TAG`] so a seed string and a raw `u64` passed to
+/// [`choose_voice`] cannot accidentally describe the same stream.
+const SEED_HASH_TAG: &[u8] = b"rasp.voice.seed";
+
+/// The 54 corpus voice ids, in `web/registry.json` order (V-02).
+///
+/// This is the **single** source of the list in Rust. A test compares it to the
+/// registry, so an id added or renamed upstream fails `cargo test` instead of
+/// silently making a voice unreachable.
+pub const CORPUS_VOICES: [&str; 54] = [
+    "af_heart",
+    "af_bella",
+    "af_nicole",
+    "af_aoede",
+    "am_fenrir",
+    "am_michael",
+    "am_puck",
+    "am_onyx",
+    "bf_emma",
+    "bf_isabella",
+    "bf_alice",
+    "bf_lily",
+    "bm_fable",
+    "bm_george",
+    "bm_lewis",
+    "bm_daniel",
+    "ef_dora",
+    "em_alex",
+    "em_santa",
+    "pf_dora",
+    "pm_alex",
+    "pm_santa",
+    "hf_alpha",
+    "hf_beta",
+    "hm_omega",
+    "hm_psi",
+    "ff_siwis",
+    "if_sara",
+    "im_nicola",
+    "jf_alpha",
+    "jf_gongitsune",
+    "jf_nezumi",
+    "jf_tebukuro",
+    "jm_kumo",
+    "zf_xiaobei",
+    "zf_xiaoni",
+    "zf_xiaoxiao",
+    "zf_xiaoyi",
+    "zm_yunjian",
+    "zm_yunxi",
+    "zm_yunxia",
+    "zm_yunyang",
+    "af_alloy",
+    "af_jessica",
+    "af_kore",
+    "af_nova",
+    "af_river",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_echo",
+    "am_eric",
+    "am_liam",
+    "am_santa",
+];
 
 /// Pitch steps that span D1's measured row, 7 st = 140 steps.
 const D1_PITCH_STEPS: i64 = 140;
@@ -479,9 +561,67 @@ fn derive_unchecked<'a>(schema: u16, seed: u64, base_voice: &'a str) -> VariantS
     }
 }
 
-/// FNV-1a 64 of `(HASH_TAG, schema, seed, voice)`.
-fn seed_hash(schema: u16, seed: u64, base_voice: &str) -> u64 {
+// ---------------------------------------------------------------------------
+// V-02 — seed → base voice
+// ---------------------------------------------------------------------------
+
+/// Hash the game's seed **string** to the `u64` the integer draws consume.
+///
+/// FNV-1a 64 over a domain tag, [`VARIANT_SCHEMA`] and the string's UTF-8 bytes.
+/// The schema is included because D24 makes `(schema, seed)` the identity of a
+/// variant: a schema bump may re-voice the cast, and that must be visible here
+/// as well as in the parameter draw, never half-applied.
+///
+/// This is a stable contract, not a hash-table detail: the same string returns
+/// the same integer on macOS, Linux and `wasm32` (D24). Empty and non-ASCII
+/// strings are valid seeds.
+pub fn seed_u64(seed: &str) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
+    hash = fnv1a64(hash, SEED_HASH_TAG);
+    hash = fnv1a64(hash, &VARIANT_SCHEMA.to_le_bytes());
+    fnv1a64(hash, seed.as_bytes())
+}
+
+/// Pick one of [`CORPUS_VOICES`] from an already-hashed seed (V-02).
+///
+/// The draw is `SplitMix64(seed_hash ⊕ voice domain) % 54`: an integer hash,
+/// no floats, no platform state. The modulo bias is below one part in `2^58`
+/// (`2^64 mod 54 == 4`), which is far below the measurement noise of a cast.
+///
+/// The distribution is intentionally the **lightest** weighting: uniform over
+/// the 54 ids. D25 does not require uniformity, but uniform cannot collapse
+/// onto a handful of voices, and a 10,000-seed test enforces 0.5 %–4 % per id.
+pub fn choose_voice(seed: u64) -> &'static str {
+    let mut stream = stream(seed, DOMAIN_VOICE);
+    let index = (stream.next_u64() % CORPUS_VOICES.len() as u64) as usize;
+    CORPUS_VOICES[index]
+}
+
+/// Resolve a game seed string to its base voice (V-02).
+///
+/// `voice_for_seed(s) == choose_voice(seed_u64(s))`, so a caller that stores
+/// either the string or its hash gets the same answer on every platform.
+pub fn voice_for_seed(seed: &str) -> &'static str {
+    choose_voice(seed_u64(seed))
+}
+
+/// Resolve a game seed string to **both** its base voice and its parameters
+/// (V-02 + V-01).
+///
+/// This is the whole `seed → voice` half of the product contract: one string in,
+/// a [`VariantSpec`] whose [`base_voice`](VariantSpec::base_voice) is the drawn
+/// corpus id, out. The returned spec borrows that `'static` id, so it can be
+/// carried without owning the string.
+///
+/// Headroom is still **not** applied here (D22): the renderer scales the
+/// requested point by the clip's measured headroom.
+pub fn derive_voice(seed: &str) -> VariantSpec<'static> {
+    let seed = seed_u64(seed);
+    derive(seed, choose_voice(seed))
+}
+
+/// FNV-1a 64 of `(HASH_TAG, schema, seed, voice)`.
+fn seed_hash(schema: u16, seed: u64, base_voice: &str) -> u64 {    let mut hash = FNV_OFFSET_BASIS;
     hash = fnv1a64(hash, HASH_TAG);
     hash = fnv1a64(hash, &schema.to_le_bytes());
     hash = fnv1a64(hash, &seed.to_le_bytes());
